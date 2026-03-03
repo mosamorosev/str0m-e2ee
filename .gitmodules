@@ -1,0 +1,4 @@
+[submodule "str0m"]
+	path = str0m
+	url = https://github.com/mosamorosev/str0m.git
+	branch = e2ee
