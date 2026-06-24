@@ -25,4 +25,5 @@ webrtc/
 client/node_modules/
 client/build/
 client/log/
+client/crashdumps/
 key-distributor/node_modules/

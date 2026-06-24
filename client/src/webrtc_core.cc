@@ -8,6 +8,10 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
+#include <cstring>
+#include <array>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -44,6 +48,9 @@
 #include "api/video_codecs/video_decoder_factory_template_dav1d_adapter.h"
 #include "api/rtp_sender_interface.h"
 #include "api/rtp_receiver_interface.h"
+#include "api/rtp_transceiver_interface.h"
+#include "api/rtp_transceiver_direction.h"
+#include "api/media_types.h"
 #include "pc/video_track_source.h"
 #include "modules/video_capture/video_capture.h"
 #include "modules/video_capture/video_capture_factory.h"
@@ -265,12 +272,130 @@ static std::string JsonEscape(const std::string& s) {
 }
 
 // --- Synthetic test video source (moving pattern) for single-machine testing ---
-// Enabled via env var E2EE_SYNTHETIC_VIDEO=1. Lets two client processes on one
-// machine both "send" video when only a single physical webcam is available.
+// Enabled via env var E2EE_SYNTHETIC_VIDEO=1. Lets several client processes on
+// one machine all "send" video when only a single physical webcam is available.
+//
+// Each synthetic source embeds a per-participant TAG directly into the rendered
+// frames: a large text label (E2EE_VIDEO_LABEL, usually the client name) drawn
+// over a per-label background colour. This makes it trivial to tell, in an N:N
+// call, which window is showing whom — the tag is part of the encoded (and then
+// E2E-encrypted) video itself, not an overlay.
+
+// Minimal 5x7 bitmap font (uppercase A-Z, digits 0-9, space). Each glyph is 7
+// rows; the low 5 bits of each row are the pixels (bit4 = leftmost column).
+struct Glyph5x7 {
+  char c;
+  uint8_t rows[7];
+};
+
+static const Glyph5x7 kFont5x7[] = {
+    {' ', {0, 0, 0, 0, 0, 0, 0}},
+    {'-', {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}},
+    {'A', {0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+    {'B', {0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E}},
+    {'C', {0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E}},
+    {'D', {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E}},
+    {'E', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F}},
+    {'F', {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10}},
+    {'G', {0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F}},
+    {'H', {0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11}},
+    {'I', {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F}},
+    {'J', {0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0C}},
+    {'K', {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}},
+    {'L', {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F}},
+    {'M', {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11}},
+    {'N', {0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11}},
+    {'O', {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+    {'P', {0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10}},
+    {'Q', {0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D}},
+    {'R', {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}},
+    {'S', {0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E}},
+    {'T', {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}},
+    {'U', {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}},
+    {'V', {0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04}},
+    {'W', {0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11}},
+    {'X', {0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11}},
+    {'Y', {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}},
+    {'Z', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}},
+    {'0', {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}},
+    {'1', {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}},
+    {'2', {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}},
+    {'3', {0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E}},
+    {'4', {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}},
+    {'5', {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E}},
+    {'6', {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}},
+    {'7', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08}},
+    {'8', {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}},
+    {'9', {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C}},
+};
+
+static const uint8_t* GlyphRows(char c) {
+  if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+  for (const auto& g : kFont5x7) {
+    if (g.c == c) return g.rows;
+  }
+  return kFont5x7[0].rows;  // space for unknown glyphs
+}
+
+// Draw `text` into the Y (luma) plane at the given scale, horizontally centred,
+// using luma value `luma` for set pixels.
+static void DrawLabelY(uint8_t* y, int stride, int width, int height,
+                       const std::string& text, int scale, uint8_t luma) {
+  const int glyph_w = 5, glyph_h = 7, gap = 1;
+  const int text_px = static_cast<int>(text.size()) * (glyph_w + gap) * scale;
+  int x0 = (width - text_px) / 2;
+  if (x0 < 0) x0 = 0;
+  const int y0 = (height - glyph_h * scale) / 2;
+
+  int pen_x = x0;
+  for (char ch : text) {
+    const uint8_t* rows = GlyphRows(ch);
+    for (int r = 0; r < glyph_h; ++r) {
+      for (int c = 0; c < glyph_w; ++c) {
+        if (rows[r] & (1 << (glyph_w - 1 - c))) {
+          for (int dy = 0; dy < scale; ++dy) {
+            for (int dx = 0; dx < scale; ++dx) {
+              int px = pen_x + c * scale + dx;
+              int py = y0 + r * scale + dy;
+              if (px >= 0 && px < width && py >= 0 && py < height) {
+                y[py * stride + px] = luma;
+              }
+            }
+          }
+        }
+      }
+    }
+    pen_x += (glyph_w + gap) * scale;
+  }
+}
+
 class SyntheticVideoCapturer : public webrtc::test::TestVideoCapturer {
  public:
-  SyntheticVideoCapturer(int width, int height, int fps)
-      : width_(width), height_(height), fps_(fps > 0 ? fps : 30) {}
+  SyntheticVideoCapturer(int width, int height, int fps, std::string label)
+      : width_(width),
+        height_(height),
+        fps_(fps > 0 ? fps : 30),
+        label_(std::move(label)) {
+    // Derive a vivid, per-label background colour (in U/V) from the label hash
+    // so each participant's synthetic video is also colour-coded.
+    static const uint8_t kPalette[][2] = {
+        {84, 255},   // red
+        {43, 21},    // green
+        {255, 107},  // blue
+        {54, 34},    // teal
+        {202, 222},  // magenta
+        {16, 146},   // yellow-ish
+        {120, 60},   // olive
+        {180, 200},  // purple
+    };
+    uint32_t h = 2166136261u;
+    for (char c : label_) {
+      h = (h ^ static_cast<uint8_t>(c)) * 16777619u;
+    }
+    const int idx = static_cast<int>(h % (sizeof(kPalette) / sizeof(kPalette[0])));
+    bg_u_ = kPalette[idx][0];
+    bg_v_ = kPalette[idx][1];
+  }
   ~SyntheticVideoCapturer() override { Stop(); }
 
   void Start() override {
@@ -289,29 +414,41 @@ class SyntheticVideoCapturer : public webrtc::test::TestVideoCapturer {
   void Loop() {
     const int frame_interval_ms = 1000 / fps_;
     uint32_t frame_num = 0;
+    // Scale the label to roughly a third of the frame height.
+    const int scale = std::max(2, height_ / (7 * 3));
     while (running_.load()) {
       auto buffer = webrtc::I420Buffer::Create(width_, height_);
       uint8_t* y = buffer->MutableDataY();
       const int stride_y = buffer->StrideY();
+      // Animated diagonal gradient background (provides motion for the encoder).
       for (int r = 0; r < height_; ++r) {
         for (int c = 0; c < width_; ++c) {
           y[r * stride_y + c] =
-              static_cast<uint8_t>((c + r + frame_num * 3) & 0xFF);
+              static_cast<uint8_t>(40 + ((c + r + frame_num * 3) & 0x3F));
         }
       }
+      // Per-label background colour fills the chroma planes.
       uint8_t* u = buffer->MutableDataU();
       uint8_t* v = buffer->MutableDataV();
       const int cw = (width_ + 1) / 2;
       const int ch = (height_ + 1) / 2;
-      const int stride_u = buffer->StrideU();
-      const int stride_v = buffer->StrideV();
-      for (int r = 0; r < ch; ++r) {
-        for (int c = 0; c < cw; ++c) {
-          u[r * stride_u + c] = static_cast<uint8_t>((c * 2 + frame_num) & 0xFF);
-          v[r * stride_v + c] =
-              static_cast<uint8_t>((r * 2 + frame_num * 2) & 0xFF);
+      (void)cw;
+      std::memset(u, bg_u_, static_cast<size_t>(buffer->StrideU()) * ch);
+      std::memset(v, bg_v_, static_cast<size_t>(buffer->StrideV()) * ch);
+
+      // A moving vertical bar so motion is obvious even on a static label.
+      const int bar_x = static_cast<int>((frame_num * 4) % width_);
+      for (int r = 0; r < height_; ++r) {
+        for (int w = 0; w < 6 && bar_x + w < width_; ++w) {
+          y[r * stride_y + bar_x + w] = 16;
         }
       }
+
+      // The participant tag, drawn bright (near-white luma) and centred.
+      if (!label_.empty()) {
+        DrawLabelY(y, stride_y, width_, height_, label_, scale, 235);
+      }
+
       webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
                                      .set_video_frame_buffer(buffer)
                                      .set_rotation(webrtc::kVideoRotation_0)
@@ -327,6 +464,9 @@ class SyntheticVideoCapturer : public webrtc::test::TestVideoCapturer {
   int width_;
   int height_;
   int fps_;
+  std::string label_;
+  uint8_t bg_u_ = 128;
+  uint8_t bg_v_ = 128;
   std::atomic<bool> running_{false};
   std::unique_ptr<std::thread> thread_;
 };
@@ -334,7 +474,8 @@ class SyntheticVideoCapturer : public webrtc::test::TestVideoCapturer {
 // --- Video capture source (wraps VcmCapturer) ---
 class CapturerTrackSource : public webrtc::VideoTrackSource {
  public:
-  static webrtc::scoped_refptr<CapturerTrackSource> Create() {
+  static webrtc::scoped_refptr<CapturerTrackSource> Create(
+      const std::string& fallback_label = "") {
     auto env_size = [](const char* name, size_t fallback) -> size_t {
       const char* v = std::getenv(name);
       if (v && v[0]) {
@@ -349,11 +490,14 @@ class CapturerTrackSource : public webrtc::VideoTrackSource {
 
     const char* synth = std::getenv("E2EE_SYNTHETIC_VIDEO");
     if (synth && synth[0] && synth[0] != '0') {
-      DEMO_LOG("Using SYNTHETIC video source (E2EE_SYNTHETIC_VIDEO=%s) %zux%zu@%zu",
-               synth, kWidth, kHeight, kFps);
+      const char* label_env = std::getenv("E2EE_VIDEO_LABEL");
+      std::string label =
+          (label_env && label_env[0]) ? std::string(label_env) : fallback_label;
+      DEMO_LOG("Using SYNTHETIC video source (E2EE_SYNTHETIC_VIDEO=%s) %zux%zu@%zu label='%s'",
+               synth, kWidth, kHeight, kFps, label.c_str());
       auto capturer = std::make_unique<SyntheticVideoCapturer>(
           static_cast<int>(kWidth), static_cast<int>(kHeight),
-          static_cast<int>(kFps));
+          static_cast<int>(kFps), label);
       capturer->Start();
       return webrtc::make_ref_counted<CapturerTrackSource>(
           std::unique_ptr<webrtc::test::TestVideoCapturer>(capturer.release()));
@@ -407,13 +551,12 @@ class VideoRenderer : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
  public:
   VideoRenderer(int width, int height, const wchar_t* title = L"WebRTC Video")
       : width_(width), height_(height), hwnd_(nullptr), title_(title) {
-    // Create window on a background thread (with its own message loop)
-    thread_ = std::make_unique<std::thread>(&VideoRenderer::WindowThread, this);
-    // Wait until window is created
-    for (int i = 0; i < 100 && !hwnd_; ++i) {
-      Sleep(10);
-    }
-    DEMO_LOG("VideoRenderer window created: hwnd=%p", (void*)hwnd_);
+    // The OS window (and its message-loop thread) is created lazily on the
+    // FIRST received frame — see EnsureWindow()/OnFrame. A negotiated-but-idle
+    // receive slot (part of the fixed transceiver pool) never delivers frames,
+    // so it never pops an empty window. The window therefore appears only when
+    // a remote participant actually starts sending — which also covers late
+    // joiners whose media begins flowing into a pre-negotiated slot.
   }
 
   ~VideoRenderer() override {
@@ -426,6 +569,7 @@ class VideoRenderer : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   }
 
   void OnFrame(const webrtc::VideoFrame& frame) override {
+    EnsureWindow();
     frame_count_++;
     if (frame_count_ == 1) {
       DEMO_LOG("VideoRenderer: first frame %dx%d", frame.width(), frame.height());
@@ -452,7 +596,23 @@ class VideoRenderer : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
     }
   }
 
+  // True once at least one frame has been received (i.e. the window exists and
+  // is showing a real remote participant rather than an idle pool slot).
+  bool active() const { return frame_count_ > 0; }
+
  private:
+  // Spawn the window + message-loop thread exactly once, on the first frame.
+  // Called from OnFrame on a WebRTC worker thread; std::call_once makes it
+  // safe and idempotent. We do not block waiting for the hwnd — OnFrame stores
+  // the frame under buffer_mutex_ and the window paints it once created.
+  void EnsureWindow() {
+    std::call_once(window_once_, [this]() {
+      DEMO_LOG("VideoRenderer: creating window '%ls' on first frame",
+               title_.c_str());
+      thread_ = std::make_unique<std::thread>(&VideoRenderer::WindowThread, this);
+    });
+  }
+
   void WindowThread() {
     // Register window class on this thread
     WNDCLASSEXW wc = {};
@@ -465,7 +625,7 @@ class VideoRenderer : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
     RegisterClassExW(&wc);
 
     hwnd_ = CreateWindowExW(
-        0, kVideoWndClass, title_,
+        0, kVideoWndClass, title_.c_str(),
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT, width_ + 16, height_ + 39,
         nullptr, nullptr, GetModuleHandle(nullptr), this);
@@ -533,8 +693,9 @@ class VideoRenderer : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
   }
 
   int width_, height_;
-  const wchar_t* title_;
+  const std::wstring title_;
   HWND hwnd_;
+  std::once_flag window_once_;
   std::unique_ptr<std::thread> thread_;
   std::mutex buffer_mutex_;
   std::vector<uint8_t> argb_buffer_;
@@ -560,7 +721,7 @@ struct WebrtcPeer : public webrtc::PeerConnectionObserver {
 
   // Video state
   webrtc::scoped_refptr<CapturerTrackSource> video_source;
-  std::unique_ptr<VideoRenderer> video_renderer;   // remote video
+  std::vector<std::unique_ptr<VideoRenderer>> video_renderers;  // remote videos (one per participant)
   std::unique_ptr<VideoRenderer> local_preview;     // local camera preview
 
   // Logging
@@ -683,11 +844,18 @@ struct WebrtcPeer : public webrtc::PeerConnectionObserver {
     if (track && track->kind() == webrtc::MediaStreamTrackInterface::kVideoKind) {
       track->set_enabled(true);
       DEMO_LOG("OnTrack: enabled remote video track");
-      // Create renderer window and attach as sink
+      // Create a renderer per negotiated receive slot. The window itself is
+      // created lazily on the first real frame (see VideoRenderer), so an idle
+      // pool slot stays invisible — a window pops only when a remote
+      // participant actually starts sending into this slot (including late
+      // joiners). We keep one renderer per slot rather than overwriting.
       auto* video_track = static_cast<webrtc::VideoTrackInterface*>(track.get());
-      video_renderer = std::make_unique<VideoRenderer>(640, 480, L"Remote Video");
-      video_track->AddOrUpdateSink(video_renderer.get(), webrtc::VideoSinkWants());
-      DEMO_LOG("VideoRenderer attached to remote video track");
+      int idx = static_cast<int>(video_renderers.size()) + 1;
+      std::wstring title = L"Remote Video " + std::to_wstring(idx);
+      auto renderer = std::make_unique<VideoRenderer>(640, 480, title.c_str());
+      video_track->AddOrUpdateSink(renderer.get(), webrtc::VideoSinkWants());
+      video_renderers.push_back(std::move(renderer));
+      DEMO_LOG("VideoRenderer #%d attached to remote video track", idx);
       PushEvent("remote_video_track", "{\"state\":\"added\"}");
     }
   }
@@ -817,7 +985,7 @@ WebrtcPeer* webrtc_create(int role, const char* username) {
   // (same bidirectional pattern as audio to ensure proper SDP negotiation)
   if (role == 0) {
     // Caller: open camera
-    peer->video_source = CapturerTrackSource::Create();
+    peer->video_source = CapturerTrackSource::Create(username ? username : "");
     if (peer->video_source) {
       auto video_track = peer->factory->CreateVideoTrack(
           peer->video_source, "video_label");
@@ -840,6 +1008,13 @@ WebrtcPeer* webrtc_create(int role, const char* username) {
   } else {
     DEMO_LOG("Callee: no local video track (receive only)");
   }
+
+  // Receive slots for N:N conferences are no longer pre-allocated from a fixed
+  // pool. The initial offer carries just this client's own sendrecv audio+video
+  // (one receive slot per kind, enough for a 1:1 call). When more participants
+  // join, the SFU tells this client (via GET /signal) to add recvonly
+  // transceivers and re-offer — see webrtc_add_recv_transceivers(). Each new
+  // remote sender then lands on its own slot and OnTrack opens a window for it.
 
   // Send transformers are created per sender below; receive transformers are
   // created per receiver (here for any pre-existing receivers, and in OnTrack
@@ -872,7 +1047,7 @@ void webrtc_destroy(WebrtcPeer* peer) {
   if (!peer) return;
   DEMO_LOG("webrtc_destroy");
   peer->local_preview.reset();
-  peer->video_renderer.reset();
+  peer->video_renderers.clear();
   peer->video_source = nullptr;
   if (peer->pc) { peer->pc->Close(); peer->pc = nullptr; }
   peer->factory = nullptr;
@@ -917,7 +1092,14 @@ char* webrtc_get_video_info(WebrtcPeer* peer) {
   oss << "{";
   if (peer) {
     oss << "\"has_video_source\":" << (peer->video_source ? "true" : "false");
-    oss << ",\"has_video_renderer\":" << (peer->video_renderer ? "true" : "false");
+    // Count only renderers that have received frames (i.e. actually showing a
+    // remote participant), not idle pre-negotiated pool slots.
+    int active_windows = 0;
+    for (auto& r : peer->video_renderers) {
+      if (r && r->active()) active_windows++;
+    }
+    oss << ",\"remote_video_windows\":" << active_windows;
+    oss << ",\"remote_video_slots\":" << peer->video_renderers.size();
     if (peer->pc) {
       int video_senders = 0, video_receivers = 0;
       for (auto& s : peer->pc->GetSenders()) {
@@ -1059,7 +1241,7 @@ void webrtc_close(WebrtcPeer* peer) {
   if (peer && peer->pc) {
     DEMO_LOG("webrtc_close");
     peer->pc->Close();
-    peer->video_renderer.reset();
+    peer->video_renderers.clear();
     if (peer->video_source) {
       peer->video_source->StopCapture();
     }
@@ -1122,6 +1304,36 @@ int webrtc_install_e2ee_key(WebrtcPeer* peer, int key_id,
   DEMO_LOG("E2E recv key installed on %zu receiver(s), key_id=%u",
            peer->e2ee_recv_transformers.size(), kid);
   return 0;
+}
+
+int webrtc_add_recv_transceivers(WebrtcPeer* peer, int n_audio, int n_video) {
+  if (!peer || !peer->pc) return -1;
+  if (n_audio < 0) n_audio = 0;
+  if (n_video < 0) n_video = 0;
+
+  webrtc::RtpTransceiverInit init;
+  init.direction = webrtc::RtpTransceiverDirection::kRecvOnly;
+
+  int added = 0;
+  for (int i = 0; i < n_audio; ++i) {
+    auto r = peer->pc->AddTransceiver(webrtc::MediaType::AUDIO, init);
+    if (r.ok()) {
+      ++added;
+    } else {
+      DEMO_LOG("ERROR: AddTransceiver(recv audio): %s", r.error().message());
+    }
+  }
+  for (int i = 0; i < n_video; ++i) {
+    auto r = peer->pc->AddTransceiver(webrtc::MediaType::VIDEO, init);
+    if (r.ok()) {
+      ++added;
+    } else {
+      DEMO_LOG("ERROR: AddTransceiver(recv video): %s", r.error().message());
+    }
+  }
+  DEMO_LOG("Added %d recvonly transceiver(s) (audio=%d video=%d)", added,
+           n_audio, n_video);
+  return added;
 }
 
 }  // extern "C"

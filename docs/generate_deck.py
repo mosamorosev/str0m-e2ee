@@ -206,15 +206,18 @@ footer(s, num())
 
 # ── Slide 4 — Status ────────────────────────────────────────
 s = slide(); header(s, "Implementation status", "Where we are")
-box(s, Inches(0.7), Inches(1.9), Inches(11.9), Inches(1.2),
+box(s, Inches(0.7), Inches(1.7), Inches(11.9), Inches(1.0),
     ["Phase 1 — 1:1 DTLS-SRTP tunnel (SFU relays opaque packets)        ✅ Verified"],
     fill=PANEL, line=ACCENT, size=18, align=PP_ALIGN.LEFT)
-box(s, Inches(0.7), Inches(3.3), Inches(11.9), Inches(1.2),
+box(s, Inches(0.7), Inches(2.85), Inches(11.9), Inches(1.0),
     ["Phase 2 — PERC double encryption (HBH SFU + frame E2E + Key Distributor)   ✅ Verified"],
     fill=PANEL, line=ACCENT2, size=18, align=PP_ALIGN.LEFT)
-box(s, Inches(0.7), Inches(4.9), Inches(11.9), Inches(1.3),
+box(s, Inches(0.7), Inches(4.0), Inches(11.9), Inches(1.0),
+    ["Phase 3 — Multi-party N:N with dynamic SDP renegotiation                 ✅ Verified"],
+    fill=PANEL, line=WARN, size=18, align=PP_ALIGN.LEFT)
+box(s, Inches(0.7), Inches(5.2), Inches(11.9), Inches(1.2),
     ["Now working end-to-end",
-     "Two-way encrypted audio + video · keyframe relay · per-conference key rotation · unified config"],
+     "3-party encrypted audio + video · per-peer windows · keyframe relay · per-conference key rotation"],
     fill=SFUC, line=ACCENT, size=16, bold=True)
 footer(s, num())
 
@@ -381,7 +384,28 @@ bullets(s, Inches(0.7), Inches(4.8), Inches(11.8), [
 ])
 footer(s, num())
 
-# ── Slide 13 — What the SFU sees ────────────────────────────
+# ── Slide 13b — Multi-party (N:N) dynamic renegotiation ─────
+s = slide(); header(s, "Multi-party (N:N) — dynamic SDP renegotiation", "Phase 3")
+box(s, Inches(0.7), Inches(1.7), Inches(2.5), Inches(1.0),
+    ["alice joins", "offers own A+V"], fill=CLIENT, line=ACCENT, size=14, bold=True)
+box(s, Inches(3.5), Inches(1.7), Inches(2.5), Inches(1.0),
+    ["bob joins", "1:1 — no reneg"], fill=CLIENT, line=ACCENT, size=14, bold=True)
+box(s, Inches(6.3), Inches(1.7), Inches(2.5), Inches(1.0),
+    ["carol joins", "SFU recomputes"], fill=SFUC, line=ACCENT, size=14, bold=True)
+box(s, Inches(9.1), Inches(1.7), Inches(3.5), Inches(1.0),
+    ["all re-offer +1 slot", "3-way fan-out"], fill=SFUC, line=WARN, size=14, bold=True)
+arrow(s, Inches(3.2), Inches(2.2), Inches(3.5), Inches(2.2), MUTED, 1.5)
+arrow(s, Inches(6.0), Inches(2.2), Inches(6.3), Inches(2.2), MUTED, 1.5)
+arrow(s, Inches(8.8), Inches(2.2), Inches(9.1), Inches(2.2), MUTED, 1.5)
+bullets(s, Inches(0.7), Inches(3.1), Inches(11.8), [
+    "No fixed transceiver pool, no maxParticipants cap — the client is always the offerer.",
+    "Initial offer carries only the client's own sendrecv audio+video, so 1:1 needs zero reneg.",
+    "On membership change the SFU computes recv_slots = participants − 1 per kind, per client.",
+    "Client polls GET /signal?client_id=N; when slots grow it adds recvonly transceivers and re-offers.",
+    "POST /offer is relayed into the SFU run loop (request/reply channel) so accept_offer runs on the live Rtc.",
+    "assign_slot pins each origin to a distinct m-line → every remote peer renders in its own window.",
+])
+footer(s, num())
 s = slide(); header(s, "What the SFU can — and cannot — see", "Security")
 box(s, Inches(0.7), Inches(1.9), Inches(5.8), Inches(3.6),
     ["VISIBLE", "", "RTP headers (SSRC/PT/seq/ts)",
@@ -415,7 +439,7 @@ bullets(s, Inches(0.7), Inches(3.3), Inches(11.8), [
     "Node apps share config-loader.js; str0m uses a matching loader in examples/util.",
     "Client pushes media params to native via env vars (width/height/fps/bitrate/codec).",
     "Toggles: log-to-file, periodic stats, wire log, per-frame E2E diagnostics.",
-    "run-all.ps1 launches SFU + KD + two clients against the shared config.",
+    "run-all.ps1 launches SFU + KD + N clients (default alice/bob/carol) against the shared config.",
 ])
 footer(s, num())
 
@@ -424,13 +448,14 @@ s = slide(); header(s, "Done & what's next", "Roadmap")
 box(s, Inches(0.7), Inches(1.9), Inches(5.8), Inches(3.4),
     ["COMPLETED ✅", "", "Key Distributor service",
      "Frame-level AES-128-GCM E2E", "PERC-capable native client",
-     "VP8 keyframe marker", "Keyframe (PLI/FIR) relay", "Unified config + launcher"],
+     "VP8 keyframe marker · PLI/FIR relay",
+     "Multi-party N:N (dynamic reneg)", "Unified config + launcher"],
     fill=PANEL, line=ACCENT2, size=15, bold=False, align=PP_ALIGN.LEFT)
 box(s, Inches(6.8), Inches(1.9), Inches(5.8), Inches(3.4),
     ["NEXT", "", "RFC 8723 at the SRTP layer",
-     "Multi-party (N:N) routing", "EKT (RFC 8870) key transport",
-     "Certificate pinning to identity", "Encrypted headers (Cryptex)",
-     "MLS group key agreement"],
+     "EKT (RFC 8870) key transport", "Certificate pinning to identity",
+     "Encrypted headers (Cryptex)", "MLS group key agreement",
+     "Simulcast / layer selection"],
     fill=PANEL, line=ACCENT, size=15, bold=False, align=PP_ALIGN.LEFT)
 footer(s, num())
 

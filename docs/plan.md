@@ -1,6 +1,6 @@
 # E2EE WebRTC — Implementation Plan
 
-## Status: ✅ Phase 1 Complete | ✅ Phase 2 Complete (T7–T10) | 📋 Phase 3 Planned (N:N)
+## Status: ✅ Phase 1 Complete | ✅ Phase 2 Complete (T7–T10) | ✅ Phase 3 N:N Implemented (T11–T15, verified with 3 users)
 
 ## Overview
 
@@ -136,7 +136,7 @@ All tasks complete and verified with end-to-end audio/video.
     codec SDP munging, file logging, `rekey` command, autoConnect).
   - Native client reads media env vars (width/height/fps/bitrate), header-only `log_util.h`
     for `E2EE_LOG_FILE`, per-frame diagnostics gated behind `E2EE_FRAME_DIAG`.
-  - `run-all.ps1` launcher (SFU + KD + two clients).
+  - `run-all.ps1` launcher (SFU + KD + N clients, default alice/bob/carol).
   - Docs: `architecture.md` updated for PERC + config; `README.md` rewritten; architecture
     slide deck (`docs/E2EE-Architecture.pptx` + `docs/generate_deck.py`).
 
@@ -149,70 +149,77 @@ All tasks complete and verified with end-to-end audio/video.
 
 ---
 
-## Phase 3: Multi-Party PERC (N:N) 📋 Planned
+## Phase 3: Multi-Party PERC (N:N) ✅ Implemented (T11–T15) · ◐ T16 partial · ☐ T17 future
 
-Extend the verified 1:1 PERC pipeline to conferences of N participants. The inner E2E
-encryption model is unchanged — each sender encrypts once with its own E2E key and the SFU
-still never decrypts media. The work is in **routing to many receivers**, **distributing
-every sender's key to every receiver**, and **handling participants joining/leaving**.
+Extends the verified 1:1 PERC pipeline to conferences of N participants. The inner E2E
+encryption model is unchanged — each sender encrypts once and the SFU still never decrypts
+media. **Verified locally with 3 users** (`alice`/`bob`/`carol`): each participant opens two
+remote windows showing the others' tagged, encrypted synthetic video; the SFU fans out to
+all participants with per-origin receive-slot pinning.
 
-### Current 1:1 assumptions to remove
+### Key simplification vs. the original plan
 
-The PERC SFU (`e2ee_perc.rs`) and client are hard-wired for two participants:
+The original plan assumed **per-sender keys** (a map of `endpoint_id → key`, selected by
+SSRC). The Key Distributor already hands every endpoint a **single shared conference group
+key** (same `key_id` for all), and the per-frame IV travels inside the packet payload. So:
 
-- **Room = exactly two clients** with roles `'A'`/`'B'`; pairing waits for the 2nd offer.
-- **Forwarding** sends each packet to "the opposite role" (`peer_role = if 'A' {'B'} else {'A'}`).
-- **Keyframe relay** targets the opposite role, not a specific sender.
-- **One tx stream per media kind** per client (`find_tx_mid_for_kind`) — a receiver has a
-  single audio + single video slot, enough for one remote peer only.
-- **Client installs one E2E key**; the frame transformer decrypts everything with it.
-- **SDP is static**: two m-lines (audio+video), negotiated once at join.
+- No per-sender key map is needed — every participant encrypts/decrypts with one group key.
+- The SFU may freely rewrite SSRCs (receive-slot pinning) because the receiver reads the IV
+  from the payload, not from the SSRC. The E2E layer was already N:N-ready.
+
+### 1:1 assumptions removed
+
+- ~~Room = exactly two clients with roles `'A'`/`'B'`~~ → `conf_id`-grouped roster of N
+  independent clients; the SFU returns the answer immediately in the POST response.
+- ~~Forwarding to "the opposite role"~~ → fan out each packet to **all other** participants.
+- ~~Keyframe relay to the opposite role~~ → relayed to the **specific origin** sender.
+- ~~One tx slot per kind~~ → receive slots added **dynamically via SDP renegotiation**
+  (one per other participant); no fixed pool.
+- Client still installs one E2E key — but it is the **shared group key**, valid for all peers.
 
 ### Tasks
 
-- [ ] **T11 — SFU multi-party room model**
-  Replace the A/B role model with a participant roster: `Room { participants: Vec<Participant> }`,
-  each with a stable `endpoint_id`. Accept 1..N offers into the same `conf-id` instead of
-  pairing exactly two. Forwarding becomes "for each received packet, fan out to **all other**
-  participants in the room." Track origin `endpoint_id` per RTP SSRC for routing and stats.
+- [x] **T11 — SFU multi-party conference model** *(done)*
+  `e2ee_perc.rs` rewritten: `PercClient { conf_id, name, … }` roster (no A/B pairing); each
+  client an independent DTLS-SRTP session; `handle_offer` parses `{sdp, room, name}` and
+  returns the answer in the POST response; forwarding fans out to all other participants in
+  the same `conf_id`; origin id tracked per RTP packet.
 
-- [ ] **T12 — Dynamic receive slots (SDP renegotiation)**
-  Each receiver needs a distinct audio+video slot **per remote sender**. Two options to
-  evaluate:
-  - *Transceiver pool*: pre-allocate K `recvonly` m-line pairs per client; the SFU binds each
-    remote sender to a free slot. Simple, but caps the conference at K.
-  - *Renegotiation on join/leave*: SFU drives an offer/answer update adding/removing m-lines
-    as membership changes. More flexible; needs trickle/renegotiation plumbing in the client.
-  Choose one (pool first for a working demo, renegotiation as the robust path). Define the
-  SSRC↔slot mapping the SFU presents to each receiver.
+- [x] **T12 — Dynamic receive slots (SDP renegotiation)** *(done — renegotiation, no pool)*
+  A client's initial offer carries only its own `sendrecv` audio+video. On membership change
+  the SFU recomputes the desired slot count (`participants−1` per kind) and publishes it via
+  `GET /signal?client_id=N`; the client tops up `recvonly` transceivers (`addRecvTransceivers`)
+  and re-offers carrying its SFU-assigned `client_id`, and the run loop renegotiates the live
+  `Rtc` with `accept_offer`. `assign_slot()` still pins each origin to a distinct m-line so
+  each participant renders in its own window. A 2-party call needs zero renegotiation; the
+  conference grows/shrinks with no `maxParticipants` cap. All `Rtc` ownership stays in the run
+  loop — `POST /offer` is relayed there over a request/reply channel.
 
-- [ ] **T13 — Per-sender keyframe request routing**
-  Map an incoming PLI/FIR from a receiver to the **specific origin SSRC/endpoint** it was
-  requested for (via the slot↔sender mapping from T12), then relay `request_keyframe()` to
-  that sender's rx stream — instead of the current opposite-role broadcast.
+- [x] **T13 — Per-sender keyframe request routing** *(done)*
+  A receiver's PLI/FIR is reverse-mapped from its receive slot to the origin participant
+  (`slot_for_origin`) and `request_keyframe()` is relayed only to that sender's rx stream,
+  with a broadcast fallback if the slot is not yet assigned.
 
-- [ ] **T14 — KD multi-key distribution & roster**
-  Distribute **every participant's** E2E key to **every** endpoint (the KD already tracks
-  per-endpoint keys and `getRekeyBundle().allKeys`). Add a participant roster + SSRC↔endpoint
-  association so receivers can map an incoming stream to the right sender key. Push roster and
-  key updates over the existing WebSocket channel on join/leave.
+- [x] **T14 — KD key distribution** *(done — shared group key, no change needed)*
+  The KD already issues a shared conference group key (same `key_id`) to every endpoint;
+  join does not rotate the KEK, so all participants converge on one key and can decrypt each
+  other. No per-sender key map or SSRC↔endpoint association is required.
 
-- [ ] **T15 — Client multi-stream rendering + multi-key decryption**
-  Install a **map** of E2E keys keyed by sender (`endpoint_id`/`key_id`) rather than a single
-  key. In the receive frame transformer, select the decryption key by the frame's SSRC →
-  sender mapping. Render N remote video tiles + mix N remote audio streams. Update `client.js`
-  to handle multiple remote tracks and the roster.
+- [x] **T15 — Client multi-stream rendering + in-video tag** *(done)*
+  One `VideoRenderer` window per remote video track; the synthetic source embeds a
+  per-participant **name tag** (label from the constructor / `E2EE_VIDEO_LABEL`) so streams
+  are visually distinct on one machine. `client.js` threads `room`/`name` into the offer.
 
-- [ ] **T16 — Membership churn & rekey propagation**
-  Support participants joining and leaving mid-conference: KEK rotation on membership change
-  (already implemented in the KD) must propagate new keys to all endpoints and drop departed
-  senders' slots/keys. Verify forward secrecy on leave (rotated key) and that late joiners
-  get a keyframe (via T13) to start decoding each active sender.
+- [◐] **T16 — Membership churn & rekey propagation** *(partial)*
+  Join works without rekey (stable group key); leave rotates the KEK (KD) for forward
+  secrecy and broadcasts a rekey. Late joiners get a keyframe via T13. Full mid-call
+  churn hardening (slot reclamation on leave, rekey reinstall race) is future work.
 
 - [ ] **T17 — Bandwidth & media optimization (stretch)**
   Scale media gracefully: simulcast/SVC layer selection per receiver, active-speaker-only
   forwarding (forward top-N audio + their video), and per-receiver bandwidth estimation.
   Keeps N:N usable beyond a handful of participants. Optional for an initial N:N demo.
+
 
 ### Phase 3 Task Dependencies
 

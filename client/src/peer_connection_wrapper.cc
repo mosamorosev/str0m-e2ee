@@ -22,6 +22,8 @@ Napi::Object PeerConnectionWrapper::Init(Napi::Env env,
           InstanceMethod("getVideoInfo", &PeerConnectionWrapper::GetVideoInfo),
           InstanceMethod("installE2eeKey",
                          &PeerConnectionWrapper::InstallE2eeKey),
+          InstanceMethod("addRecvTransceivers",
+                         &PeerConnectionWrapper::AddRecvTransceivers),
       });
   exports.Set("PeerConnection", func);
   return exports;
@@ -160,5 +162,20 @@ Napi::Value PeerConnectionWrapper::InstallE2eeKey(
     rc = webrtc_install_e2ee_key(peer_, key_id, buf.Data(),
                                  static_cast<int>(buf.Length()));
   }
+  return Napi::Number::New(env, rc);
+}
+
+Napi::Value PeerConnectionWrapper::AddRecvTransceivers(
+    const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) {
+    Napi::TypeError::New(env, "Expected (nAudio: number, nVideo: number)")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  int n_audio = info[0].As<Napi::Number>().Int32Value();
+  int n_video = info[1].As<Napi::Number>().Int32Value();
+  int rc = -1;
+  if (peer_) rc = webrtc_add_recv_transceivers(peer_, n_audio, n_video);
   return Napi::Number::New(env, rc);
 }

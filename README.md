@@ -9,6 +9,9 @@ read it — the media payload stays end-to-end encrypted under keys the server n
 - **Phase 2 ✅** — PERC double encryption. SFU terminates only hop-by-hop SRTP for routing;
   an inner end-to-end (E2E) layer keeps audio **and** video sealed. Verified working
   end-to-end through the SFU.
+- **Phase 3 ✅** — Multi-party (N:N) conferences. A shared conference group key plus dynamic
+  SDP renegotiation lets the SFU fan each sender's media out to all others without ever
+  decrypting it. Verified locally with 3 users.
 
 The system is inspired by the IETF PERC framework:
 [RFC 8871](https://datatracker.ietf.org/doc/html/rfc8871) (solution framework) and
@@ -47,15 +50,15 @@ payload is forwarded byte-for-byte.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│              Inner E2E payload (per encoded frame)                │
-│                                                                    │
-│  [key_id : 1B] [IV : 12B] [ ciphertext : N ] [GCM tag : 16B]      │
-│                                                                    │
-│   key_id  — KEK SPI / epoch selector (from the Key Distributor)    │
-│   IV      — SSRC (4B, big-endian) ‖ frame counter (8B)            │
-│   cipher  — AES-128-GCM(plaintext) under the E2E key              │
-│   tag     — 128-bit GCM authentication tag                        │
-│   overhead = 1 + 12 + 16 = 29 bytes per frame                     │
+│              Inner E2E payload (per encoded frame)               │
+│                                                                  │
+│  [key_id : 1B] [IV : 12B] [ ciphertext : N ] [GCM tag : 16B]     │
+│                                                                  │
+│   key_id  — KEK SPI / epoch selector (from the Key Distributor)  │
+│   IV      — SSRC (4B, big-endian) ‖ frame counter (8B)           │
+│   cipher  — AES-128-GCM(plaintext) under the E2E key             │
+│   tag     — 128-bit GCM authentication tag                       │
+│   overhead = 1 + 12 + 16 = 29 bytes per frame                    │
 └──────────────────────────────────────────────────────────────────┘
 
 VIDEO frames additionally carry a 1-byte cleartext marker BEFORE key_id:
@@ -71,7 +74,7 @@ str0m-e2ee/
 ├── README.md                 # This file
 ├── config.json               # Unified config for all apps (JSONC, sectioned)
 ├── config-loader.js          # Shared Node.js config loader (client + KD)
-├── run-all.ps1               # Launch SFU + KD + two clients from config
+├── run-all.ps1               # Launch SFU + KD + N clients (default alice/bob/carol)
 │
 ├── docs/
 │   ├── architecture.md       # Detailed architecture document with diagrams
@@ -212,7 +215,7 @@ Then, in each client window:
 > connect-perc bob
 ```
 
-> Running two clients on one machine? Set `media.video.synthetic: true` in `config.json`
+> Running multiple clients on one machine? Set `media.video.synthetic: true` in `config.json`
 > (a single webcam can only be opened by the first process).
 
 ### Manual start — 4 terminals
@@ -311,34 +314,33 @@ Node.js CLI wrapping a C++ libwebrtc addon:
 | SFU reads RTP routing headers | ❌ (opaque) | ⚠️ yes (for routing) | Per-leg HBH SRTP in PERC |
 | Metadata (size/timing) | ⚠️ visible | ⚠️ visible | Inherent to relayed media |
 
-## Roadmap — Phase 3: Multi-Party (N:N)
+## Phase 3 — Multi-Party (N:N) ✅ implemented
 
-The verified system today handles **1:1 PERC rooms**. The next phase extends it to
-conferences of N participants **without changing the encryption model** — each sender still
-encrypts once with its own E2E key, and the SFU still never decrypts media. The work is in
-routing to many receivers, distributing every sender's key to every receiver, and handling
-participants joining/leaving.
+The system now runs **N-participant conferences** (verified locally with 3 users) **without
+changing the encryption model** — each sender still encrypts once with the shared conference
+E2E key, and the SFU still never decrypts media. Participants that pass the same `confId`
+land in one conference; the SFU fans each sender's media out to all others.
 
-| Step | Goal |
-|------|------|
-| **T11 — SFU multi-party room model** | Replace the A/B role pairing with an N-participant roster; fan out each sender's media to all other participants; track origin endpoint per SSRC. |
-| **T12 — Dynamic receive slots** | Give each receiver an audio+video slot per remote sender, via a pre-allocated transceiver pool (simple) or SDP renegotiation on join/leave (flexible). |
-| **T13 — Per-sender keyframe routing** | Relay each PLI/FIR to the specific origin sender (by SSRC↔sender map) instead of the current opposite-role broadcast. |
-| **T14 — KD multi-key distribution** | Distribute every participant's E2E key to every endpoint, plus a roster + SSRC↔endpoint association, pushed over WebSocket on membership change. |
-| **T15 — Client multi-stream + multi-key** | Install a map of E2E keys keyed by sender; select the decrypt key by incoming SSRC; render N video tiles and mix N audio streams. |
-| **T16 — Membership churn & rekey** | Join/leave mid-conference with KEK rotation propagated to all endpoints; forward secrecy on leave; late joiners get a keyframe to start decoding. |
-| **T17 — Bandwidth & media optimization** (stretch) | Simulcast/SVC layer selection, active-speaker-only forwarding, and per-receiver BWE to scale beyond a handful of participants. |
+| Step | Goal | Status |
+|------|------|:---:|
+| **T11 — SFU multi-party conference model** | Replaced the A/B role pairing with an N-participant roster keyed by `confId`; each client runs an independent DTLS-SRTP session; every sender's media is fanned out to all other participants. | ✅ |
+| **T12 — Dynamic receive slots (SDP renegotiation)** | A client's initial offer carries only its own `sendrecv` audio+video. As participants join, the SFU publishes the desired slot count via `GET /signal`; the client adds `recvonly` transceivers (`addRecvTransceivers`) and re-offers with its `client_id`, and the SFU renegotiates the live `Rtc`. No fixed pool, no `maxParticipants` cap — `assign_slot` still pins each origin to a distinct m-line so every participant renders in its own window. | ✅ |
+| **T13 — Per-sender keyframe routing** | Each PLI/FIR is mapped from the requester's receive slot back to the exact origin sender (slot↔origin map) and relayed only to that sender, with a broadcast fallback. | ✅ |
+| **T14 — KD key distribution** | The Key Distributor hands every endpoint a **shared conference group key** (same `key_id` for all), so any participant can decrypt any other. No per-sender key map needed; the IV travels in each packet payload, so SFU SSRC rewrites are safe. | ✅ |
+| **T15 — Client multi-stream** | One renderer window per remote video track; a per-participant **in-video name tag** (drawn into the synthetic source) makes streams easy to tell apart on one machine. | ✅ |
+| **T16 — Membership churn & rekey** | Join works without rekey (stable group key); leave rotates the KEK with forward secrecy. Late-joiner keyframe handling via T13. | ◐ partial |
+| **T17 — Bandwidth & media optimization** (stretch) | Simulcast/SVC layer selection, active-speaker-only forwarding, per-receiver BWE. | ☐ future |
 
-```
-  T11 ──► T12 ──► T13
-  T14 ──► T15
-  T11, T15 ──► T16
-  T16 ──► T17 (optional)
-```
+**Try it (single machine, 3 users):** set `media.video.synthetic: true` in `config.json`,
+then run `./run-all.ps1` (launches the SFU, Key Distributor, and `alice` / `bob` / `carol`).
+In each client REPL: `connect-perc <name>`. The conference grows dynamically — a 2-party
+call needs no renegotiation, and each later joiner makes every client re-offer one extra
+slot. Each participant opens one remote window per other participant, showing their tagged,
+encrypted synthetic video.
 
-See [`docs/plan.md`](docs/plan.md) for the detailed Phase 3 plan, the 1:1 assumptions to
-remove, and open design questions (receive-slot strategy, conference-size target,
-key-to-stream binding, RTCP fan-out, and per-`Rtc` CPU cost).
+See [`docs/plan.md`](docs/plan.md) for the detailed Phase 3 design and remaining work
+(churn/rekey hardening, simulcast, active-speaker forwarding, per-`Rtc` CPU cost).
+
 
 ### Longer-term
 

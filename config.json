@@ -53,6 +53,13 @@
     "kdUrl": "http://localhost:4000",
     "confId": "default",         // peers sharing a confId exchange E2EE keys
 
+    // Legacy hint. Conference size is now fully dynamic: clients add receive
+    // slots on the fly via SDP renegotiation (GET /signal + re-offer), so there
+    // is no fixed pool or cap. Kept for backward compatibility; currently unused.
+    "conference": {
+      "maxParticipants": 3
+    },
+
     "autoConnect": false,        // launch straight into PERC mode (no prompt)
     "autoConnectName": "",       // name to use when autoConnect is true
 

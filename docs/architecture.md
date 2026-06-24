@@ -30,10 +30,12 @@ and [RFC 8723 (PERC Double Encryption)](https://datatracker.ietf.org/doc/html/rf
 |-------|------|--------|
 | Phase 1 | 1:1 DTLS-SRTP tunnel (SFU relays opaque packets) | ✅ Verified |
 | Phase 2 | PERC double encryption (HBH SFU + frame-level E2E + Key Distributor) | ✅ Verified — encrypted audio **and** video flow end-to-end |
+| Phase 3 | N:N multi-party conference (one shared E2E key, SFU fan-out) | ✅ Verified locally with 3 users — see Section 12 |
 
 Sections 2–9 document the **tunnel mode** design. Section 10 documents the **PERC
 double-encryption mode** that is now the primary, verified implementation. Section 11
-documents the **unified configuration system** shared by all three apps.
+documents the **unified configuration system** shared by all three apps. Section 12
+documents the **N:N multi-party conference model** (Phase 3).
 
 ---
 
@@ -674,17 +676,87 @@ Resolution order (first match wins for the path list):
 | `client` | `autoConnect`/`autoConnectName` | Hands-free PERC start |
 | `client` | `media.video.codec` | SDP-munged preferred codec (VP8/VP9/H264/AV1) |
 | `client` | `media.video.width/height/fps/maxBitrateKbps` | Capture/encode params → env vars |
-| `client` | `media.video.synthetic` | Animated synthetic source (two clients, one machine) |
+| `client` | `media.video.synthetic` | Animated synthetic source with in-video name tag (multiple clients, one machine) |
+| `client` | `conference.maxParticipants` | Legacy hint; conference size is now dynamic (renegotiation), so this is unused |
 | `client` | `e2ee.rekeyOnCommand` | Enable the interactive `rekey` command |
 | shared | `logging.toFile`/`dir`/`timestamped` | Tee console (and native `E2EE_LOG_FILE`) to file |
 | shared | `diagnostics.e2eeFrameLog` | Per-SSRC SEND/RECV frame + keyframe logging |
 
-`run-all.ps1` launches the whole stack (SFU + KD + two clients) each pointed at the shared
-config file.
+`run-all.ps1` launches the whole stack (SFU + KD + N clients, default `alice`/`bob`/`carol`)
+each pointed at the shared config file.
 
 ---
 
-## 12. Future Work
+## 12. Multi-Party (N:N) Conference Model — Phase 3
+
+Phase 3 turns the 1:1 PERC room into an **N-participant conference** *without changing the
+encryption model*. Each sender still encrypts every frame once with the shared conference
+E2E key, and the SFU still never holds an E2E key. Only routing and key fan-out change.
+
+### 12.1 Conference membership
+
+- Clients that POST an offer with the same `room` (conference id) join one conference; the
+  SFU groups them by `conf_id`. There is **no A/B pairing** — each client runs an
+  independent DTLS-SRTP session with the SFU and the SFU returns the answer immediately in
+  the POST response (no answer polling).
+- The Key Distributor issues every endpoint the **same conference group key** (same
+  `key_id`), so any participant can decrypt any other. Because the per-frame IV travels
+  inside the packet payload (`[marker][key_id][IV][ciphertext][tag]`), the SFU may rewrite
+  SSRCs freely without breaking GCM.
+
+### 12.2 Fan-out and receive slots
+
+```
+                 ┌──────────────── SFU (conf_id="team") ────────────────┐
+   alice ──tx──► │  for each pkt from O: forward to every other client  │
+   bob   ──tx──► │  assign_slot(receiver, origin O, kind) → local m-line │ ──► alice (2 windows)
+   carol ──tx──► │  (each origin pinned to a distinct receive slot)      │ ──► bob   (2 windows)
+                 └───────────────────────────────────────────────────────┘ ──► carol (2 windows)
+```
+
+- Each client's **initial offer carries only its own `sendrecv` audio + video** (one
+  receive slot per kind — enough for a 1:1 call). Receive slots for additional
+  participants are added **dynamically by SDP renegotiation**: there is no fixed pool and
+  no `maxParticipants` cap.
+- When conference membership changes, the SFU recomputes the desired receive-slot count
+  (`participants − 1` per kind) for every client and publishes it via `GET
+  /signal?client_id=N`. A client polls this endpoint; when the desired count exceeds what
+  it currently offers, it adds the difference as `recvonly` transceivers
+  (`addRecvTransceivers`) and **re-offers**, carrying its SFU-assigned `client_id` so the
+  SFU renegotiates the existing session (`accept_offer` on the live `Rtc`) instead of
+  treating it as a new join. The re-offer is idempotent — once a client already has enough
+  slots the instruction is a no-op.
+- `assign_slot(receiver, origin, kind)` pins each origin participant to one of the
+  receiver's free local m-lines, so every remote participant lands in its **own** render
+  window. The mapping is stable for the lifetime of the conference.
+- A 2-party call needs **zero renegotiation** (the initial sendrecv lines suffice); the
+  third and later participants each trigger exactly one re-offer per existing client that
+  adds one audio + one video slot.
+
+### 12.3 Per-sender keyframe routing
+
+A receiver's PLI/FIR arrives on the receive slot it is missing a keyframe for. The SFU
+reverse-maps that slot to the origin participant (`slot_for_origin`) and relays the keyframe
+request to **only that sender**, falling back to a broadcast if the slot is not yet assigned.
+
+### 12.4 Single-machine testing & the in-video tag
+
+For local testing the synthetic video source draws a per-participant **name tag** (and a
+per-name background colour) directly into the encoded frames, so the encrypted streams stay
+visually distinct across windows. The label is the participant name passed to the native
+`PeerConnection` constructor (overridable with `E2EE_VIDEO_LABEL`). `run-all.ps1 -Names
+alice,bob,carol` launches the SFU, KD and three tagged clients sharing one `confId`.
+
+### 12.5 Remaining work
+
+- **Churn/rekey hardening** — join needs no rekey (stable group key); leave rotates the KEK
+  for forward secrecy. Late-joiner keyframe handling uses 12.3.
+- **Scale** — simulcast/SVC layer selection, active-speaker-only forwarding and per-receiver
+  BWE to grow beyond a handful of participants (each participant is a separate `Rtc`).
+
+---
+
+## 13. Future Work
 
 ### Completed (Phase 2 — PERC Double Encryption) ✅
 
@@ -693,10 +765,15 @@ config file.
 - **PERC-capable Native Client** — installs E2E keys from the KD, prepends the VP8 keyframe marker, strips/decrypts on receive.
 - **Keyframe (PLI/FIR) relay** in the SFU so mid-stream receivers get a keyframe.
 
+### Completed (Phase 3 — Multi-Party N:N) ✅
+
+- **Conference fan-out SFU** — `conf_id`-grouped roster, per-origin receive-slot pinning, per-sender keyframe routing (Section 12).
+- **Shared conference group key** — one E2E key/`key_id` for all endpoints; IV carried in payload so SSRC rewrites are safe.
+- **Client multi-stream** — one render window per remote participant + in-video name tag for single-machine testing.
+
 ### Longer-term
 
 - **RFC 8723 at the SRTP layer** — move the inner layer into SRTP double-encryption proper (vs. the current frame-transformer approach).
-- **Multi-party (N:N)** — extend PERC routing beyond 1:1 rooms to full conferences.
 - **EKT (RFC 8870)** — piggyback E2E key transport on SRTP instead of a side channel.
 - **Certificate pinning** — pin DTLS certificates to user identity for stronger authentication.
 - **Encrypted header extensions (Cryptex)** — hide remaining RTP metadata from the SFU.

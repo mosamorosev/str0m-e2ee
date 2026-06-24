@@ -44,6 +44,12 @@ void webrtc_close(WebrtcPeer* peer);
 int webrtc_install_e2ee_key(WebrtcPeer* peer, int key_id,
                             const unsigned char* key, int key_len);
 
+// Dynamic renegotiation: add recvonly transceivers so a later createOffer can
+// negotiate more receive slots (one per remote participant). Used for N:N
+// conferences that grow at runtime instead of pre-allocating a fixed pool.
+// Returns the number of transceivers added, or -1 on error.
+int webrtc_add_recv_transceivers(WebrtcPeer* peer, int n_audio, int n_video);
+
 // Event polling - caller must free returned events with webrtc_free_events
 int webrtc_poll_events(WebrtcPeer* peer, WebrtcEvent** out_events,
                        int* out_count);

@@ -12,6 +12,7 @@ const { config: CFG, sources: CFG_SOURCES } = loadConfig("client", {
   confId: "default",
   autoConnect: false,
   autoConnectName: "",
+  conference: { maxParticipants: 3 },
   media: {
     video: {
       codec: "VP8",
@@ -76,8 +77,18 @@ let remotePeer = null;
 let inCall = false;
 let sfuMode = false;
 let sfuUrl = null;
+let percConfId = null;
 let sfuRoomId = null;
 let sfuPollTimer = null;
+// Dynamic renegotiation state (PERC N:N). The SFU assigns `percClientId` in the
+// answer to our initial offer; we send it back on re-offers so it renegotiates
+// the existing session. `percRecvSlots` tracks how many receive m-lines per kind
+// we currently offer (1 = our own sendrecv line). `percRenegotiating` guards
+// against overlapping re-offers. `sfuSignalTimer` polls GET /signal.
+let percClientId = null;
+let percRecvSlots = 1;
+let percRenegotiating = false;
+let sfuSignalTimer = null;
 
 // PERC E2EE state
 let kdUrl = null;
@@ -265,26 +276,82 @@ function sfuHttpRequest(method, path, body) {
 }
 
 async function sfuSendOffer(sdp) {
+  // Carry our SFU-assigned id on re-offers so the SFU renegotiates the existing
+  // session instead of treating this as a brand-new participant.
+  const isReneg = percClientId !== null;
   try {
     const result = await sfuHttpRequest("POST", "/offer", {
       type: "offer",
       sdp,
+      room: percConfId || get(CFG, "confId", "default"),
+      name: myName || "?",
+      ...(isReneg ? { client_id: percClientId } : {}),
     });
 
+    if (result.error) {
+      log(`SFU offer error: ${result.error}`);
+      percRenegotiating = false;
+      return;
+    }
+
+    if (typeof result.client_id === "number" && percClientId === null) {
+      percClientId = result.client_id;
+      log(`SFU assigned client id ${percClientId}.`);
+    }
+
     if (result.status === "waiting") {
-      // First client — need to poll for answer
+      // Legacy 1:1 pairing path — poll for the answer.
       sfuRoomId = result.room_id;
       log(`Joined room ${sfuRoomId}. Waiting for peer...`);
       sfuStartPollingAnswer();
     } else if (result.sdp) {
-      // Second client — got answer immediately
-      log("Paired with peer! Setting remote answer...");
       pc.setRemoteDescription("answer", result.sdp);
+      log(isReneg ? "Renegotiation answer applied." : "Connected to SFU.");
     } else {
       log(`Unexpected SFU response: ${JSON.stringify(result)}`);
     }
   } catch (e) {
     log(`SFU offer error: ${e.message}`);
+  } finally {
+    if (isReneg) percRenegotiating = false;
+  }
+}
+
+// Poll the SFU for renegotiation instructions. When the conference grows, the
+// SFU asks us to offer one receive slot per other participant; we top up
+// recvonly transceivers to that count and re-offer. Idempotent: once we already
+// have enough slots, instructions are ignored.
+function startSignalPolling() {
+  if (sfuSignalTimer) return;
+  sfuSignalTimer = setInterval(async () => {
+    if (!pc || percClientId === null || percRenegotiating) return;
+    try {
+      const result = await sfuHttpRequest(
+        "GET",
+        `/signal?client_id=${percClientId}`,
+        null
+      );
+      const desired = result && typeof result.recv_slots === "number"
+        ? result.recv_slots
+        : 0;
+      if (desired > percRecvSlots) {
+        const add = desired - percRecvSlots;
+        percRenegotiating = true;
+        log(`Conference grew — adding ${add} receive slot(s) per kind (total ${desired}).`);
+        pc.addRecvTransceivers(add, add);
+        percRecvSlots = desired;
+        pc.createOffer();
+      }
+    } catch (e) {
+      // Transient poll errors are non-fatal; try again next tick.
+    }
+  }, 500);
+}
+
+function stopSignalPolling() {
+  if (sfuSignalTimer) {
+    clearInterval(sfuSignalTimer);
+    sfuSignalTimer = null;
   }
 }
 
@@ -586,11 +653,20 @@ function handleCommand(input) {
       kdUrl = kd;
       sfuMode = true;
       percMode = true;
+      percConfId = confId;
 
-      // Create PeerConnection with E2EE support
+      // Create PeerConnection with E2EE support. The participant name is passed
+      // to the native addon and used as the in-video tag for the synthetic
+      // source (E2EE_VIDEO_LABEL overrides it if set before the addon loaded).
+      // Receive slots are negotiated dynamically: the initial offer carries just
+      // our own audio+video, and the SFU asks us to add more as peers join.
       pc = new addon.PeerConnection(0, myName);
       inCall = true;
+      percClientId = null;
+      percRecvSlots = 1;
+      percRenegotiating = false;
       startPolling();
+      startSignalPolling();
 
       // Join conference on Key Distributor, then create offer
       joinPercConference(kd, myName, confId).then(() => {
@@ -792,6 +868,7 @@ Commands:
 function endCall() {
   inCall = false;
   stopPolling();
+  stopSignalPolling();
   if (sfuPollTimer) {
     clearInterval(sfuPollTimer);
     sfuPollTimer = null;
@@ -801,6 +878,9 @@ function endCall() {
     pc = null;
   }
   pendingOffer = null;
+  percClientId = null;
+  percRecvSlots = 1;
+  percRenegotiating = false;
 }
 
 // --- Main ---
