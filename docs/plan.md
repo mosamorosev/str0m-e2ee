@@ -1,27 +1,20 @@
 # E2EE WebRTC — Implementation Plan
 
-## Status: ✅ Phase 1 Complete | ✅ Phase 2 Complete (T7–T10) | ✅ Phase 3 N:N Implemented (T11–T15, verified with 3 users)
+## Status: ✅ Complete — multi-party (N:N) PERC E2EE conferencing, verified with 3 users
 
 ## Overview
 
-End-to-end encrypted WebRTC conferencing using a str0m SFU in DTLS tunnel mode with
-native C++ clients. The end-state architecture follows the PERC framework (RFC 8871/8723)
-with double encryption for multi-party conferences.
+End-to-end encrypted multi-party WebRTC conferencing using a str0m SFU and native C++
+clients. The architecture follows the PERC framework (RFC 8871/8723) with double encryption:
+each client applies an inner end-to-end layer, and the SFU terminates only the hop-by-hop
+SRTP it needs for routing — it never holds the E2E key.
 
-### Current Architecture (Phase 1 — 1:1 Tunnel)
+> **Note:** An earlier prototype used a 1:1 DTLS *tunnel mode* (the SFU forwarded
+> DTLS/SRTP/SRTCP opaquely). That mode — its str0m `set_tunnel_mode` API, the `e2ee_tunnel`
+> example, and the client `connect-sfu` command — has since been **removed**. The sections
+> below are kept as a development record; the shipping system is the PERC pipeline.
 
-```
-Client A  ──DTLS/SRTP──►  str0m SFU  ──DTLS/SRTP──►  Client B
-                          (tunnel mode)
-
-- ICE: terminated at SFU (NAT traversal)
-- DTLS: forwarded end-to-end (SFU does NOT terminate)
-- SRTP: forwarded opaquely (SFU has no keys)
-- RTCP: forwarded as-is (pass-through)
-- SDP: fingerprint + SSRC swapping for E2E DTLS
-```
-
-### End-State Architecture (Phase 2 — PERC, as implemented)
+### Architecture (PERC, as implemented)
 
 ```
                     ┌────────────────┐
@@ -44,18 +37,19 @@ Notes:
 - KD↔client transport is HTTP + WebSocket (not a DTLS tunnel; RFC 9185 is future work).
 - Inner E2E is applied at the encoded-frame boundary (AES-128-GCM), not at the SRTP layer.
 - The SFU forwards the inner payload byte-for-byte (no per-packet OHB rewriting).
-- Current rooms are 1:1; N:N routing is future work.
+- N:N conferences via a shared group key + dynamic SDP renegotiation (no participant cap).
 ```
 
 ---
 
-## Phase 1: 1:1 SRTP Tunnel Mode ✅
+## Phase 1: 1:1 SRTP Tunnel Mode ✅ (superseded — tunnel mode since removed)
 
-All tasks complete and verified with end-to-end audio/video.
+All tasks were completed and verified with end-to-end audio/video. Tunnel mode has since
+been removed from the codebase in favour of the PERC pipeline; this section is historical.
 
 - [x] **T0 — WebRTC Checkout & Native Client**
   Set up libwebrtc build environment, create native C++ client with Node.js CLI.
-  WebRTC source in `webrtc/`, client in `client/`, P2P + SFU modes.
+  WebRTC source in `webrtc/`, client in `client/`, SFU (PERC) mode.
 
 - [x] **T1 — DTLS Pass-Through in str0m**
   Added `set_tunnel_mode(true)` to `RtcConfig`. DTLS packets emitted as
@@ -123,7 +117,7 @@ All tasks complete and verified with end-to-end audio/video.
   - 1-byte cleartext VP8 keyframe marker on video frames (`0x00`=key, `0x01`=delta) so the
     receiver's depacketizer classifies frames correctly despite the encrypted bitstream
   - Key installation API: `webrtc_install_e2ee_key()` C API + N-API `installE2eeKey()` binding
-  - KD integration in `client.js`: `connect-perc` command, conference join, WebSocket key updates
+  - KD integration in `client.js`: `connect` command, conference join, WebSocket key updates
   - Build updated (`build.bat`): new source file + bcrypt.lib
   - Client builds successfully with E2EE support
 

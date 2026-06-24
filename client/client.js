@@ -70,10 +70,8 @@ try {
 }
 
 // --- State ---
-let ws = null;
 let pc = null;
 let myName = null;
-let remotePeer = null;
 let inCall = false;
 let sfuMode = false;
 let sfuUrl = null;
@@ -177,33 +175,21 @@ function handlePeerEvent(evt) {
         }
       }
       pc.setLocalDescription(data.type, data.sdp);
-      if (sfuMode) {
-        // SFU mode: send offer via HTTP POST
-        sfuSendOffer(data.sdp);
-      } else {
-        sendSignal({ type: "offer", sdp: data.sdp });
-      }
+      // SFU mode: send offer via HTTP POST
+      sfuSendOffer(data.sdp);
       log("Offer created and sent.");
       break;
 
     case "answer_created":
       pc.setLocalDescription(data.type, data.sdp);
-      if (sfuMode) {
-        // In SFU mode, we shouldn't create answers (SFU gives us the answer)
-        log("Warning: answer_created in SFU mode (unexpected).");
-      } else {
-        sendSignal({ type: "answer", sdp: data.sdp });
-      }
+      // In SFU mode, we shouldn't create answers (SFU gives us the answer)
+      log("Warning: answer_created in SFU mode (unexpected).");
       log("Answer created and sent to peer.");
       break;
 
     case "ice_candidate":
-      if (sfuMode) {
-        // In SFU tunnel mode, ICE candidates are embedded in the SDP (ICE-lite).
-        // Trickle ICE is not used — ignore individual candidates.
-      } else {
-        sendSignal({ type: "ice_candidate", candidate: data });
-      }
+      // In SFU mode, ICE candidates are embedded in the SDP (ICE-lite).
+      // Trickle ICE is not used — ignore individual candidates.
       break;
 
     case "ice_connection_state":
@@ -213,9 +199,9 @@ function handlePeerEvent(evt) {
     case "connection_state":
       log(`Connection state: ${data.state}`);
       if (data.state === "connected") {
-        log("P2P connection established!");
+        log("Media connection established!");
       } else if (data.state === "failed" || data.state === "disconnected") {
-        log("P2P connection lost.");
+        log("Media connection lost.");
       }
       break;
 
@@ -380,71 +366,6 @@ function sfuStartPollingAnswer() {
   }, 1000);
 }
 
-// --- WebSocket signaling ---
-
-function sendSignal(msg) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(msg));
-  }
-}
-
-function handleSignalingMessage(msg) {
-  switch (msg.type) {
-    case "registered":
-      log(`Connected to server as "${msg.name}".`);
-      break;
-
-    case "peer_joined":
-      remotePeer = msg.name;
-      log(`Peer joined: "${msg.name}". You can now type 'call' to start a call.`);
-      break;
-
-    case "peer_left":
-      log(`Peer left: "${msg.name}".`);
-      if (inCall) {
-        endCall();
-        log("Call ended (peer disconnected).");
-      }
-      remotePeer = null;
-      break;
-
-    case "offer":
-      log(`Incoming call from "${remotePeer || "peer"}"!`);
-      log('Type "answer" to accept the call.');
-      // Store the offer to apply when user types 'answer'
-      pendingOffer = msg;
-      break;
-
-    case "answer":
-      if (pc) {
-        pc.setRemoteDescription("answer", msg.sdp);
-        log("Remote answer received. Connecting...");
-      }
-      break;
-
-    case "ice_candidate":
-      if (pc && msg.candidate) {
-        pc.addIceCandidate(
-          msg.candidate.sdpMid,
-          msg.candidate.sdpMLineIndex,
-          msg.candidate.candidate
-        );
-      }
-      break;
-
-    case "hangup":
-      log("Remote peer ended the call.");
-      endCall();
-      break;
-
-    case "error":
-      log(`Server error: ${msg.message}`);
-      break;
-  }
-}
-
-let pendingOffer = null;
-
 // --- PERC Key Distributor Integration ---
 
 const http = require("http");
@@ -537,7 +458,12 @@ function installE2eKeys(keyBundle) {
 }
 
 function connectKdWebSocket(kd, name) {
-  const wsUrl = kd.replace(/^http/, "ws") + `/ws/endpoint?id=${name}`;
+  // Server expects /ws/endpoint?conference=<id>&endpoint=<id> and closes the
+  // socket otherwise; conferenceId/endpointId are set by joinPercConference.
+  const q =
+    `conference=${encodeURIComponent(conferenceId)}` +
+    `&endpoint=${encodeURIComponent(endpointId || name)}`;
+  const wsUrl = kd.replace(/^http/, "ws") + `/ws/endpoint?${q}`;
   try {
     kdWs = new WebSocket(wsUrl);
     kdWs.on("open", () => log("KD WebSocket connected"));
@@ -575,67 +501,9 @@ function handleCommand(input) {
 
   switch (cmd) {
     case "connect": {
-      if (ws) {
-        log("Already connected. Disconnect first.");
-        break;
-      }
-      const name = parts[1];
-      const server = parts[2] || "ws://localhost:8080";
-      if (!name) {
-        log("Usage: connect <yourname> [server_url]");
-        break;
-      }
-      myName = name;
-      ws = new WebSocket(server);
-      ws.on("open", () => {
-        sendSignal({ type: "register", name: myName });
-      });
-      ws.on("message", (data) => {
-        try {
-          handleSignalingMessage(JSON.parse(data));
-        } catch {}
-      });
-      ws.on("close", () => {
-        log("Disconnected from server.");
-        ws = null;
-      });
-      ws.on("error", (err) => {
-        log(`Connection error: ${err.message}`);
-        ws = null;
-      });
-      break;
-    }
-
-    case "connect-sfu": {
-      if (sfuMode || ws) {
-        log("Already connected. Disconnect first.");
-        break;
-      }
-      const name = parts[1];
-      const url = parts[2] || "https://localhost:3000";
-      if (!name) {
-        log("Usage: connect-sfu <yourname> <sfu-url>");
-        log("  e.g.: connect-sfu alice https://10.8.1.113:3000");
-        break;
-      }
-      myName = name;
-      sfuUrl = url;
-      sfuMode = true;
-
-      // Create PeerConnection and send offer to SFU
-      // Role 0 = caller (sends audio + video)
-      pc = new addon.PeerConnection(0, myName);
-      inCall = true;
-      startPolling();
-      pc.createOffer();
-      log(`Connecting to SFU at ${sfuUrl} as "${myName}"...`);
-      break;
-    }
-
-    case "connect-perc": {
-      // Connect to PERC SFU with E2EE via Key Distributor
-      // Usage: connect-perc <name> <sfu-url> [kd-url] [conf-id]
-      if (sfuMode || percMode || ws) {
+      // Connect to PERC SFU with E2EE via Key Distributor (default mode)
+      // Usage: connect <name> <sfu-url> [kd-url] [conf-id]
+      if (sfuMode || percMode) {
         log("Already connected. Disconnect first.");
         break;
       }
@@ -644,8 +512,8 @@ function handleCommand(input) {
       const kd = parts[3] || get(CFG, "kdUrl", "http://localhost:4000");
       const confId = parts[4] || get(CFG, "confId", "default");
       if (!name) {
-        log("Usage: connect-perc <name> <sfu-url> [kd-url] [conf-id]");
-        log("  e.g.: connect-perc alice https://10.8.1.113:3000 http://10.8.1.113:4000");
+        log("Usage: connect <name> <sfu-url> [kd-url] [conf-id]");
+        log("  e.g.: connect alice https://10.8.1.113:3000 http://10.8.1.113:4000");
         break;
       }
       myName = name;
@@ -679,79 +547,22 @@ function handleCommand(input) {
       break;
     }
 
-    case "call": {
-      if (!ws && !sfuMode) {
-        log("Not connected. Use 'connect <name>' or 'connect-sfu <name> <url>' first.");
-        break;
-      }
-      if (!remotePeer) {
-        log("No peer available. Wait for another client to connect.");
-        break;
-      }
-      if (inCall) {
-        log("Already in a call. Use 'end' to hang up first.");
-        break;
-      }
-      // Create PeerConnection as caller (role 0 = sends audio + video)
-      pc = new addon.PeerConnection(0, myName);
-      inCall = true;
-      startPolling();
-      pc.createOffer();
-      log(`Calling "${remotePeer}"...`);
-      break;
-    }
-
-    case "answer": {
-      if (!ws) {
-        log("Not connected.");
-        break;
-      }
-      if (!pendingOffer) {
-        log("No incoming call to answer.");
-        break;
-      }
-      // Create PeerConnection as callee (role 1 = receive audio + video)
-      pc = new addon.PeerConnection(1, myName);
-      inCall = true;
-      startPolling();
-      pc.setRemoteDescription("offer", pendingOffer.sdp);
-      pc.createAnswer();
-      pendingOffer = null;
-      log("Answering call...");
-      break;
-    }
-
-    case "end": {
-      if (!inCall) {
-        log("Not in a call.");
-        break;
-      }
-      if (!sfuMode) sendSignal({ type: "hangup" });
-      endCall();
-      log("Call ended.");
-      break;
-    }
-
     case "disconnect": {
-      if (!ws && !sfuMode) {
+      if (!sfuMode) {
         log("Not connected.");
         break;
       }
       if (inCall) {
-        if (!sfuMode) sendSignal({ type: "hangup" });
         endCall();
       }
       if (sfuPollTimer) {
         clearInterval(sfuPollTimer);
         sfuPollTimer = null;
       }
-      if (ws) ws.close();
-      ws = null;
       sfuMode = false;
       sfuUrl = null;
       sfuRoomId = null;
       myName = null;
-      remotePeer = null;
       log("Disconnected.");
       break;
     }
@@ -759,10 +570,9 @@ function handleCommand(input) {
     case "status": {
       log(
         `Name: ${myName || "(none)"} | ` +
-          `Mode: ${sfuMode ? "SFU" : ws ? "P2P" : "disconnected"} | ` +
+          `Mode: ${sfuMode ? "E2EE conference" : "disconnected"} | ` +
           `SFU: ${sfuUrl || "(none)"} | ` +
           `Room: ${sfuRoomId || "(none)"} | ` +
-          `Peer: ${remotePeer || "(none)"} | ` +
           `Call: ${inCall ? "active" : "inactive"}`
       );
       break;
@@ -770,7 +580,7 @@ function handleCommand(input) {
 
     case "audioinfo": {
       if (!pc) {
-        log("No active PeerConnection. Start a call first.");
+        log("No active PeerConnection. Connect first.");
         break;
       }
       try {
@@ -784,7 +594,7 @@ function handleCommand(input) {
 
     case "videoinfo": {
       if (!pc) {
-        log("No active PeerConnection. Start a call first.");
+        log("No active PeerConnection. Connect first.");
         break;
       }
       try {
@@ -817,28 +627,18 @@ function handleCommand(input) {
     case "help": {
       console.log(`
 Commands:
-  === P2P Mode (via WebSocket signaling server) ===
-  connect <name> [server]       - Connect to signaling server (default: ws://localhost:8080)
-  call                          - Start a call (you send audio + video)
-  answer                        - Answer an incoming call (you see/hear caller)
-
-  === SFU Tunnel Mode (via str0m E2EE SFU) ===
-  connect-sfu <name> <sfu-url>  - Connect to tunnel SFU (e.g. https://10.8.1.113:3000)
-                                  Creates offer and sends to SFU automatically.
-                                  Two clients in same SFU are paired for E2EE tunnel.
-
-  === PERC E2EE Mode (SFU + Key Distributor) ===
-  connect-perc <name> <sfu-url> [kd-url] [conf-id]
-                                - Connect to PERC SFU with E2E encryption
-                                  SFU handles HBH SRTP; KD provides E2E keys.
+  === Multi-Party E2EE Conference (SFU + Key Distributor) ===
+  connect <name> [sfu-url] [kd-url] [conf-id]
+                                - Join an end-to-end encrypted conference.
+                                  SFU handles HBH SRTP; KD provides the E2E key.
+                                  Default SFU: https://localhost:3000
                                   Default KD: http://localhost:4000
-                                  Both clients must share the same conf-id
-                                  (default: "default") to exchange E2E keys.
+                                  Clients sharing the same conf-id (default:
+                                  "default") form one conference and exchange keys.
 
   === General ===
-  end                           - End the current call
-  disconnect                    - Disconnect from server/SFU
-  rekey                         - Request a conference key rotation (PERC mode)
+  disconnect                    - Leave the conference / disconnect from the SFU
+  rekey                         - Request a conference key rotation
   status                        - Show current status
   audioinfo                     - Show audio device diagnostics
   videoinfo                     - Show video track diagnostics
@@ -849,10 +649,8 @@ Commands:
 
     case "quit": {
       if (inCall) {
-        if (!sfuMode) sendSignal({ type: "hangup" });
         endCall();
       }
-      if (ws) ws.close();
       stopPolling();
       rl.close();
       process.exit(0);
@@ -876,15 +674,14 @@ function endCall() {
   if (pc) {
     pc.close();
     pc = null;
-  }
-  pendingOffer = null;
-  percClientId = null;
+    }
+    percClientId = null;
   percRecvSlots = 1;
   percRenegotiating = false;
 }
 
 // --- Main ---
-console.log("=== WebRTC Demo Client (P2P + SFU Tunnel + PERC E2EE) ===");
+console.log("=== WebRTC E2EE Conference Client (PERC) ===");
 if (CFG_SOURCES.length) console.log(`Config: ${CFG_SOURCES.join(", ")}`);
 console.log('Type "help" for available commands.\n');
 prompt();
@@ -894,6 +691,6 @@ if (get(CFG, "autoConnect", false)) {
   const name = get(CFG, "autoConnectName", "") || `client-${process.pid}`;
   setTimeout(() => {
     log(`Auto-connecting as "${name}" (autoConnect=true)...`);
-    handleCommand(`connect-perc ${name}`);
+    handleCommand(`connect ${name}`);
   }, 250);
 }

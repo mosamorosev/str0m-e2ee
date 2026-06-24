@@ -4,14 +4,11 @@ Zero-trust WebRTC conferencing with a **str0m SFU** (Rust), a **Key Distributor*
 and a **native C++ client** (libwebrtc + Node.js CLI). The SFU routes media but can never
 read it — the media payload stays end-to-end encrypted under keys the server never holds.
 
-**Status:**
-- **Phase 1 ✅** — 1:1 DTLS tunnel mode. SFU is an opaque ICE relay (no decryption at all).
-- **Phase 2 ✅** — PERC double encryption. SFU terminates only hop-by-hop SRTP for routing;
-  an inner end-to-end (E2E) layer keeps audio **and** video sealed. Verified working
-  end-to-end through the SFU.
-- **Phase 3 ✅** — Multi-party (N:N) conferences. A shared conference group key plus dynamic
-  SDP renegotiation lets the SFU fan each sender's media out to all others without ever
-  decrypting it. Verified locally with 3 users.
+Multi-party conferences work end-to-end: the SFU terminates only the hop-by-hop SRTP it
+needs for routing, while an inner end-to-end (E2E) layer keeps audio **and** video sealed.
+A shared conference group key plus dynamic SDP renegotiation lets the SFU fan each sender's
+media out to all other participants without ever decrypting it. Verified on a single machine
+with three users.
 
 The system is inspired by the IETF PERC framework:
 [RFC 8871](https://datatracker.ietf.org/doc/html/rfc8871) (solution framework) and
@@ -34,17 +31,11 @@ The system is inspired by the IETF PERC framework:
    SFU NEVER sees: the E2E key or the decrypted media (inner layer stays sealed).
 ```
 
-Two SFU modes are provided:
-
-| Mode | Example | SFU role | Topology |
-|------|---------|----------|----------|
-| **Tunnel** (Phase 1) | `e2ee_tunnel.rs` | Terminates only ICE; forwards DTLS/SRTP/SRTCP opaquely | 1:1 |
-| **PERC** (Phase 2) | `e2ee_perc.rs` | Terminates hop-by-hop SRTP per leg, routes by SSRC, forwards inner E2E payload | 1:1 rooms |
-
-In **PERC mode**, the client applies an inner AES-128-GCM layer at the encoded-frame
-boundary (libwebrtc `FrameTransformerInterface`) using a key obtained from the Key
-Distributor. The SFU re-encrypts only the outer (hop-by-hop) SRTP per receiver; the inner
-payload is forwarded byte-for-byte.
+The SFU runs in **PERC mode** (`e2ee_perc.rs`): it terminates hop-by-hop SRTP per leg,
+routes by SSRC, and forwards the inner E2E payload byte-for-byte. The client applies an
+inner AES-128-GCM layer at the encoded-frame boundary (libwebrtc `FrameTransformerInterface`)
+using a key obtained from the Key Distributor. The SFU re-encrypts only the outer
+(hop-by-hop) SRTP per receiver; the inner payload is forwarded unmodified.
 
 ## Inner E2E Frame Format (PERC mode)
 
@@ -94,7 +85,7 @@ str0m-e2ee/
 │   │   ├── e2ee_transformer.cc/h # Inner AES-128-GCM frame transformer
 │   │   ├── log_util.h            # Shared file/stderr logging helper
 │   │   └── ...
-│   ├── client.js             # Node.js CLI (P2P, SFU tunnel, PERC modes)
+│   ├── client.js             # Node.js CLI (PERC E2EE conference)
 │   ├── build.bat             # Build script (clang-cl + lld-link)
 │   └── package.json
 │
@@ -103,8 +94,7 @@ str0m-e2ee/
 │
 └── str0m/                    # str0m WebRTC library (Rust)
     ├── examples/
-    │   ├── e2ee_perc.rs      # PERC SFU (Phase 2 — HBH SRTP + E2E forwarding)
-    │   ├── e2ee_tunnel.rs    # Tunnel SFU (Phase 1 — DTLS passthrough)
+    │   ├── e2ee_perc.rs      # PERC SFU (HBH SRTP + opaque E2E forwarding)
     │   └── util/mod.rs       # Shared example util + config loader
     └── src/
         └── rtp/ohb.rs        # Original Header Block (RFC 8723) module
@@ -133,10 +123,7 @@ str0m-e2ee/
 
 ```bash
 cd str0m
-# Phase 2 — PERC SFU (recommended)
 cargo build --example e2ee_perc --no-default-features --features "wincrypto,examples"
-# Phase 1 — Tunnel SFU
-cargo build --example e2ee_tunnel --no-default-features --features "wincrypto,examples"
 ```
 
 ### 2. Set up WebRTC (one-time, ~1 hour)
@@ -196,7 +183,7 @@ cd key-distributor
 npm install
 ```
 
-## Running (PERC mode)
+## Running
 
 All apps read the shared `config.json` (see [Configuration](#configuration)). Defaults like
 the SFU URL, KD URL, and media parameters live there, so commands stay short.
@@ -204,21 +191,27 @@ the SFU URL, KD URL, and media parameters live there, so commands stay short.
 ### Quick start — launch everything
 
 ```powershell
-# From the project root: starts SFU + Key Distributor + two client windows
+# From the project root: starts SFU + Key Distributor + three client windows
 .\run-all.ps1
 ```
 
-Then, in each client window:
+Then type `connect <name>` in each client window — one name per window:
 
 ```
-> connect-perc alice
-> connect-perc bob
+alice's window>  connect alice
+bob's window>    connect bob
+carol's window>  connect carol
 ```
 
-> Running multiple clients on one machine? Set `media.video.synthetic: true` in `config.json`
-> (a single webcam can only be opened by the first process).
+> `run-all.ps1` already forces the animated **synthetic** video source on (each client
+> tagged with its own name), so three clients run on one machine without fighting over the
+> webcam. Pass `-SyntheticVideo:$false` to use a real webcam / the `media.video.synthetic`
+> setting from `config.json` instead, or `-Names alice,bob` to launch a different set.
 
 ### Manual start — 4 terminals
+
+> Running multiple clients on one machine this way? Set `media.video.synthetic: true` in
+> `config.json` (a single webcam can only be opened by the first process).
 
 ```bash
 # Terminal 1: PERC SFU
@@ -232,16 +225,16 @@ node server.js --config ..\config.json
 # Terminal 3: Client A
 cd client
 node client.js --config ..\config.json
-> connect-perc alice
+> connect alice
 
 # Terminal 4: Client B
 cd client
 node client.js --config ..\config.json
-> connect-perc bob
+> connect bob
 ```
 
-`connect-perc <name> [sfu-url] [kd-url] [conf-id]` joins the conference on the Key
-Distributor (obtaining the E2E key), then sends an SDP offer to the SFU. Two clients sharing
+`connect <name> [sfu-url] [kd-url] [conf-id]` joins the conference on the Key
+Distributor (obtaining the E2E key), then sends an SDP offer to the SFU. Clients sharing
 the same `conf-id` exchange E2E keys and can decrypt each other's media. URLs and conf-id
 default to the values in `config.json`.
 
@@ -274,7 +267,7 @@ shared log-to-file, stats, and verbose diagnostics toggles. See the comments in
 
 ### PERC SFU (`e2ee_perc.rs`)
 
-Runs str0m in normal DTLS-SRTP + RTP mode (not tunnel mode):
+Runs str0m in normal DTLS-SRTP + RTP mode:
 - Terminates hop-by-hop DTLS-SRTP on each client leg
 - Reads RTP headers (SSRC/PT) to route media within a room
 - Forwards the inner E2E-encrypted payload **unmodified** (no per-packet OHB rewriting)
@@ -288,7 +281,8 @@ Runs str0m in normal DTLS-SRTP + RTP mode (not tunnel mode):
 ### Key Distributor (`key-distributor/`)
 
 Trusted Node.js service that issues and rotates E2E media keys:
-- `POST /conference`, `POST /:id/join` (returns a key bundle), `POST /:id/leave`
+- `POST /conference`, `POST /conference/:id/join` (returns a key bundle),
+  `POST /conference/:id/leave`
 - WebSocket `/ws/endpoint` for real-time key updates and `rekey` notifications
 - Member join/leave (or a `request_rekey`) rotates the KEK and pushes new keys
 - Never sees or relays media
@@ -296,7 +290,7 @@ Trusted Node.js service that issues and rotates E2E media keys:
 ### Native Client (`client.js` + addon)
 
 Node.js CLI wrapping a C++ libwebrtc addon:
-- `connect-perc` joins the conference, installs the E2E key (`installE2eeKey`), and offers
+- `connect` joins the conference, installs the E2E key (`installE2eeKey`), and offers
   to the SFU
 - The E2EE frame transformer applies/strips the inner AES-128-GCM layer (and the VP8
   keyframe marker) around the normal RTP pipeline
@@ -304,45 +298,48 @@ Node.js CLI wrapping a C++ libwebrtc addon:
 
 ## Security Properties
 
-| Property | Tunnel (Phase 1) | PERC (Phase 2) | Mechanism |
-|----------|:---:|:---:|-----------|
-| Media confidentiality | ✅ | ✅ | DTLS-SRTP (tunnel) / inner AES-128-GCM E2E (PERC) |
-| Media integrity | ✅ | ✅ | SRTP auth tag / GCM tag |
-| Forward secrecy (transport) | ✅ | ✅ | DTLS PFS (ECDHE) |
-| SFU has no media keys | ✅ | ✅ | Tunnel: no SRTP keys · PERC: no E2E key |
-| SFU reads media payload | ❌ never | ❌ never | Inner layer sealed in PERC |
-| SFU reads RTP routing headers | ❌ (opaque) | ⚠️ yes (for routing) | Per-leg HBH SRTP in PERC |
-| Metadata (size/timing) | ⚠️ visible | ⚠️ visible | Inherent to relayed media |
+| Property | Status | Mechanism |
+|----------|:---:|-----------|
+| Media confidentiality | ✅ | Inner AES-128-GCM E2E layer |
+| Media integrity | ✅ | GCM tag (E2E) + SRTP auth tag (per leg) |
+| Forward secrecy (transport) | ✅ | DTLS PFS (ECDHE) per leg |
+| SFU has no media keys | ✅ | SFU never holds the E2E key |
+| SFU reads media payload | ❌ never | Inner E2E layer stays sealed |
+| SFU reads RTP routing headers | ⚠️ yes (for routing) | Per-leg HBH SRTP terminates at the SFU |
+| Metadata (size/timing) | ⚠️ visible | Inherent to relayed media |
 
-## Phase 3 — Multi-Party (N:N) ✅ implemented
+## Multi-Party Conferences
 
-The system now runs **N-participant conferences** (verified locally with 3 users) **without
-changing the encryption model** — each sender still encrypts once with the shared conference
-E2E key, and the SFU still never decrypts media. Participants that pass the same `confId`
-land in one conference; the SFU fans each sender's media out to all others.
+The SFU runs **N-participant conferences** without changing the encryption model — each
+sender encrypts once with the shared conference E2E key, and the SFU never decrypts media.
+Participants that pass the same `confId` land in one conference; the SFU fans each sender's
+media out to all others.
 
-| Step | Goal | Status |
-|------|------|:---:|
-| **T11 — SFU multi-party conference model** | Replaced the A/B role pairing with an N-participant roster keyed by `confId`; each client runs an independent DTLS-SRTP session; every sender's media is fanned out to all other participants. | ✅ |
-| **T12 — Dynamic receive slots (SDP renegotiation)** | A client's initial offer carries only its own `sendrecv` audio+video. As participants join, the SFU publishes the desired slot count via `GET /signal`; the client adds `recvonly` transceivers (`addRecvTransceivers`) and re-offers with its `client_id`, and the SFU renegotiates the live `Rtc`. No fixed pool, no `maxParticipants` cap — `assign_slot` still pins each origin to a distinct m-line so every participant renders in its own window. | ✅ |
-| **T13 — Per-sender keyframe routing** | Each PLI/FIR is mapped from the requester's receive slot back to the exact origin sender (slot↔origin map) and relayed only to that sender, with a broadcast fallback. | ✅ |
-| **T14 — KD key distribution** | The Key Distributor hands every endpoint a **shared conference group key** (same `key_id` for all), so any participant can decrypt any other. No per-sender key map needed; the IV travels in each packet payload, so SFU SSRC rewrites are safe. | ✅ |
-| **T15 — Client multi-stream** | One renderer window per remote video track; a per-participant **in-video name tag** (drawn into the synthetic source) makes streams easy to tell apart on one machine. | ✅ |
-| **T16 — Membership churn & rekey** | Join works without rekey (stable group key); leave rotates the KEK with forward secrecy. Late-joiner keyframe handling via T13. | ◐ partial |
-| **T17 — Bandwidth & media optimization** (stretch) | Simulcast/SVC layer selection, active-speaker-only forwarding, per-receiver BWE. | ☐ future |
+- **Shared conference group key.** The Key Distributor hands every endpoint the same group
+  key (same `key_id`), so any participant can decrypt any other. The IV travels in each
+  packet payload, so the SFU's SSRC rewrites are safe.
+- **Dynamic SDP renegotiation.** A client's initial offer carries only its own `sendrecv`
+  audio+video, so a two-party call needs no renegotiation. As participants join, the SFU
+  publishes the desired receive-slot count via `GET /signal`; the client adds `recvonly`
+  transceivers (`addRecvTransceivers`) and re-offers with its `client_id`, and the SFU
+  renegotiates the live `Rtc`. There is no fixed transceiver pool and no participant cap —
+  `assign_slot` pins each origin to a distinct m-line so every participant renders in its
+  own window.
+- **Per-sender keyframe routing.** Each PLI/FIR is mapped from the requester's receive slot
+  back to the exact origin sender and relayed only to that sender (broadcast fallback).
+- **Membership churn.** Join works without rekey (stable group key); leave rotates the KEK
+  with forward secrecy.
+- **Per-participant in-video name tag.** Drawn into the synthetic source so the encrypted
+  streams are easy to tell apart on one machine.
 
 **Try it (single machine, 3 users):** set `media.video.synthetic: true` in `config.json`,
 then run `./run-all.ps1` (launches the SFU, Key Distributor, and `alice` / `bob` / `carol`).
-In each client REPL: `connect-perc <name>`. The conference grows dynamically — a 2-party
+In each client REPL: `connect <name>`. The conference grows dynamically — a two-party
 call needs no renegotiation, and each later joiner makes every client re-offer one extra
 slot. Each participant opens one remote window per other participant, showing their tagged,
 encrypted synthetic video.
 
-See [`docs/plan.md`](docs/plan.md) for the detailed Phase 3 design and remaining work
-(churn/rekey hardening, simulcast, active-speaker forwarding, per-`Rtc` CPU cost).
-
-
-### Longer-term
+### Possible extensions
 
 - **RFC 8723 at the SRTP layer** — move the inner layer into SRTP double-encryption proper
   (vs. the current frame-transformer approach).
@@ -351,6 +348,8 @@ See [`docs/plan.md`](docs/plan.md) for the detailed Phase 3 design and remaining
 - **Certificate pinning** — pin DTLS certificates to user identity.
 - **Encrypted header extensions (Cryptex)** — hide remaining RTP metadata from the SFU.
 - **MLS (Messaging Layer Security)** — formal group key agreement for post-compromise security.
+- **Bandwidth & media optimization** — simulcast/SVC layer selection, active-speaker-only
+  forwarding, per-receiver bandwidth estimation.
 
 ## Troubleshooting
 

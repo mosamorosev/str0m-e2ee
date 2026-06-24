@@ -454,7 +454,7 @@ void E2eeFrameTransformer::TransformReceive(
                frame->GetData().size());
       return;
     }
-    // E2EE was never armed (plain P2P/tunnel mode) — pass through unencrypted.
+    // E2EE was never armed (plain P2P mode) — pass through unencrypted.
     cb->OnTransformedFrame(std::move(frame));
     return;
   }

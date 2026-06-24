@@ -97,9 +97,9 @@ Start-Sleep -Seconds 1
 
 # 3) Clients (default: alice / bob / carol) ----------------------------------
 # Note: connect each manually inside the REPL, e.g.
-#     connect-perc alice
-#     connect-perc bob
-#     connect-perc carol
+#     connect alice
+#     connect bob
+#     connect carol
 # (defaults for sfuUrl / kdUrl / confId come from config.json), or set
 # autoConnect/autoConnectName in config.json for hands-free start.
 #
@@ -116,4 +116,4 @@ foreach ($name in $Names) {
 }
 
 Write-Host 'All components launched. Each runs in its own window.' -ForegroundColor Green
-Write-Host 'In each client window: connect-perc <name>   (e.g. connect-perc alice)' -ForegroundColor Yellow
+Write-Host 'In each client window: connect <name>   (e.g. connect alice)' -ForegroundColor Yellow

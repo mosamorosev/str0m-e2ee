@@ -205,16 +205,16 @@ box(s, Inches(0.7), Inches(4.7), Inches(11.9), Inches(1.5),
 footer(s, num())
 
 # ── Slide 4 — Status ────────────────────────────────────────
-s = slide(); header(s, "Implementation status", "Where we are")
+s = slide(); header(s, "What's built", "Where we are")
 box(s, Inches(0.7), Inches(1.7), Inches(11.9), Inches(1.0),
-    ["Phase 1 — 1:1 DTLS-SRTP tunnel (SFU relays opaque packets)        ✅ Verified"],
-    fill=PANEL, line=ACCENT, size=18, align=PP_ALIGN.LEFT)
-box(s, Inches(0.7), Inches(2.85), Inches(11.9), Inches(1.0),
-    ["Phase 2 — PERC double encryption (HBH SFU + frame E2E + Key Distributor)   ✅ Verified"],
+    ["PERC double encryption — HBH SFU + frame-level E2E + Key Distributor      ✅ Verified"],
     fill=PANEL, line=ACCENT2, size=18, align=PP_ALIGN.LEFT)
-box(s, Inches(0.7), Inches(4.0), Inches(11.9), Inches(1.0),
-    ["Phase 3 — Multi-party N:N with dynamic SDP renegotiation                 ✅ Verified"],
+box(s, Inches(0.7), Inches(2.85), Inches(11.9), Inches(1.0),
+    ["Multi-party (N:N) conferences with dynamic SDP renegotiation             ✅ Verified"],
     fill=PANEL, line=WARN, size=18, align=PP_ALIGN.LEFT)
+box(s, Inches(0.7), Inches(4.0), Inches(11.9), Inches(1.0),
+    ["Per-conference shared group key · per-sender keyframe relay              ✅ Verified"],
+    fill=PANEL, line=ACCENT, size=18, align=PP_ALIGN.LEFT)
 box(s, Inches(0.7), Inches(5.2), Inches(11.9), Inches(1.2),
     ["Now working end-to-end",
      "3-party encrypted audio + video · per-peer windows · keyframe relay · per-conference key rotation"],
@@ -244,28 +244,8 @@ text(s, Inches(0.7), Inches(5.4), Inches(11.9), Inches(1.2),
        "only the hop-by-hop SRTP differs per leg.", MUTED, False, 15)])
 footer(s, num())
 
-# ── Slide 6 — Tunnel mode (Phase 1) ─────────────────────────
-s = slide(); header(s, "Phase 1 — DTLS tunnel mode", "Foundation")
-ca = box(s, Inches(0.7), Inches(2.6), Inches(2.6), Inches(1.5),
-         ["Client A"], fill=CLIENT, line=ACCENT, size=16, bold=True)
-sfu = box(s, Inches(5.35), Inches(2.6), Inches(2.6), Inches(1.5),
-          ["SFU", "ICE relay only"], fill=SFUC, line=ACCENT, size=15, bold=True)
-cb = box(s, Inches(10.0), Inches(2.6), Inches(2.6), Inches(1.5),
-         ["Client B"], fill=CLIENT, line=ACCENT, size=16, bold=True)
-arrow(s, Inches(3.3), Inches(3.35), Inches(5.35), Inches(3.35), MUTED, 2.2, dashed=True)
-arrow(s, Inches(7.95), Inches(3.35), Inches(10.0), Inches(3.35), MUTED, 2.2, dashed=True)
-text(s, Inches(2.9), Inches(2.0), Inches(7.5), Inches(0.5),
-     "DTLS · SRTP · SRTCP forwarded as opaque bytes", size=14, color=MUTED,
-     align=PP_ALIGN.CENTER)
-bullets(s, Inches(0.7), Inches(4.5), Inches(11.8), [
-    "SFU terminates only ICE/STUN; DTLS handshake runs end-to-end between clients.",
-    "Fingerprint + SSRC swapping in the SDP answer makes E2E DTLS traverse the SFU.",
-    "SFU has no SRTP keys at all — but it is point-to-point (1:1).",
-])
-footer(s, num())
-
-# ── Slide 7 — PERC double encryption ────────────────────────
-s = slide(); header(s, "Phase 2 — PERC double encryption", "Core design")
+# ── Slide 6 — PERC double encryption ────────────────────────
+s = slide(); header(s, "PERC double encryption", "Core design")
 ca = box(s, Inches(0.7), Inches(3.0), Inches(2.7), Inches(2.0),
          ["Client A", "", "1  E2E encrypt", "2  HBH encrypt"],
          fill=CLIENT, line=ACCENT, size=14, bold=True)
@@ -308,7 +288,7 @@ footer(s, num())
 s = slide(); header(s, "Key distribution flow", "Key Distributor")
 steps = [
     "POST /conference — create",
-    "POST /:id/join — KD mints E2E master key",
+    "POST /conference/:id/join — KD mints E2E master key",
     "Key bundle returned (KEK, e2eMasterKey, kekSpi → key_id)",
     "WS /ws/endpoint — realtime key updates",
     "Member join/leave rotates KEK → 'rekey' pushed to all",
@@ -385,7 +365,7 @@ bullets(s, Inches(0.7), Inches(4.8), Inches(11.8), [
 footer(s, num())
 
 # ── Slide 13b — Multi-party (N:N) dynamic renegotiation ─────
-s = slide(); header(s, "Multi-party (N:N) — dynamic SDP renegotiation", "Phase 3")
+s = slide(); header(s, "Multi-party (N:N) — dynamic SDP renegotiation", "Conferencing")
 box(s, Inches(0.7), Inches(1.7), Inches(2.5), Inches(1.0),
     ["alice joins", "offers own A+V"], fill=CLIENT, line=ACCENT, size=14, bold=True)
 box(s, Inches(3.5), Inches(1.7), Inches(2.5), Inches(1.0),
