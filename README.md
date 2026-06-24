@@ -1,78 +1,110 @@
 # E2EE WebRTC — End-to-End Encrypted Conferencing
 
-Zero-trust WebRTC conferencing with a **str0m SFU** (Rust) and **native C++ client**
-(libwebrtc + Node.js CLI). The SFU acts as an opaque ICE relay using DTLS tunnel mode —
-it forwards all DTLS/SRTP/SRTCP packets between two clients without any decryption.
+Zero-trust WebRTC conferencing with a **str0m SFU** (Rust), a **Key Distributor** (Node.js),
+and a **native C++ client** (libwebrtc + Node.js CLI). The SFU routes media but can never
+read it — the media payload stays end-to-end encrypted under keys the server never holds.
 
-**Status:** Phase 1 complete ✅ — Two-way audio and video working end-to-end through the tunnel.
+**Status:**
+- **Phase 1 ✅** — 1:1 DTLS tunnel mode. SFU is an opaque ICE relay (no decryption at all).
+- **Phase 2 ✅** — PERC double encryption. SFU terminates only hop-by-hop SRTP for routing;
+  an inner end-to-end (E2E) layer keeps audio **and** video sealed. Verified working
+  end-to-end through the SFU.
+
+The system is inspired by the IETF PERC framework:
+[RFC 8871](https://datatracker.ietf.org/doc/html/rfc8871) (solution framework) and
+[RFC 8723](https://datatracker.ietf.org/doc/html/rfc8723) (double encryption).
 
 ## Architecture
 
 ```
-  Client A                      SFU (str0m)                       Client B
- ──────────                    ─────────────                     ──────────
-                               Tunnel Mode:
- DTLS ClientHello ─── UDP ──►  ICE only (no          ── UDP ──►  DTLS ServerHello
-                               DTLS termination)
- SRTP ─────────────── UDP ──►  Opaque forwarding     ── UDP ──►  SRTP
-                               (no decrypt/encrypt)
- SRTCP ────────────── UDP ──►  Pass-through          ── UDP ──►  SRTCP
+        E2E key (shared by participants, via the Key Distributor)
+        │                                              │
+        ▼                                              ▼
+┌────────────┐   HBH key A        ┌───────────┐   HBH key B   ┌────────────┐
+│  Client A  │  (DTLS-SRTP A)     │    SFU    │ (DTLS-SRTP B) │  Client B  │
+│ 1 E2E enc  │───────────────────►│  (PERC)   │──────────────►│ strip HBH  │
+│ 2 HBH enc  │  outer = HBH A     │ strip HBH │  outer = HBH B│ strip E2E  │
+└────────────┘                    │ read hdrs │               └────────────┘
+                                  │ re-HBH    │
+                                  └───────────┘
+   SFU sees: RTP headers (SSRC/PT/seq/ts) for routing.
+   SFU NEVER sees: the E2E key or the decrypted media (inner layer stays sealed).
 ```
 
-The SFU uses str0m's **tunnel mode** (`set_tunnel_mode(true)`) — it only terminates ICE
-for NAT traversal. DTLS handshake, SRTP keys, and all media flow end-to-end between the
-two clients through the SFU as an opaque relay. The SFU **cannot** decrypt anything.
+Two SFU modes are provided:
 
-SDP fingerprint swapping ensures each client verifies the other's DTLS certificate
-(not the SFU's), establishing a true end-to-end DTLS session.
+| Mode | Example | SFU role | Topology |
+|------|---------|----------|----------|
+| **Tunnel** (Phase 1) | `e2ee_tunnel.rs` | Terminates only ICE; forwards DTLS/SRTP/SRTCP opaquely | 1:1 |
+| **PERC** (Phase 2) | `e2ee_perc.rs` | Terminates hop-by-hop SRTP per leg, routes by SSRC, forwards inner E2E payload | 1:1 rooms |
 
-## Packet Format (Phase 1 — Standard SRTP Tunnel)
+In **PERC mode**, the client applies an inner AES-128-GCM layer at the encoded-frame
+boundary (libwebrtc `FrameTransformerInterface`) using a key obtained from the Key
+Distributor. The SFU re-encrypts only the outer (hop-by-hop) SRTP per receiver; the inner
+payload is forwarded byte-for-byte.
+
+## Inner E2E Frame Format (PERC mode)
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                   SRTP Packet on Wire                      │
-│                                                            │
-│  RTP Header  [V│P│X│CC│M│PT│Seq│Timestamp│SSRC]            │
-│  (cleartext — SFU could read but doesn't parse in tunnel)  │
-│                                                            │
-│  Encrypted Payload                                         │
-│  (AES-128-CM, opaque to SFU — no SRTP keys)                │
-│                                                            │
-│  SRTP Auth Tag (HMAC-SHA1-80)                              │
-│  (SFU cannot verify — no keys)                             │
-└────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│              Inner E2E payload (per encoded frame)                │
+│                                                                    │
+│  [key_id : 1B] [IV : 12B] [ ciphertext : N ] [GCM tag : 16B]      │
+│                                                                    │
+│   key_id  — KEK SPI / epoch selector (from the Key Distributor)    │
+│   IV      — SSRC (4B, big-endian) ‖ frame counter (8B)            │
+│   cipher  — AES-128-GCM(plaintext) under the E2E key              │
+│   tag     — 128-bit GCM authentication tag                        │
+│   overhead = 1 + 12 + 16 = 29 bytes per frame                     │
+└──────────────────────────────────────────────────────────────────┘
 
-DTLS handshake happens E2E between clients through the tunnel.
-Both clients derive SRTP keys from the same DTLS session.
-SFU never has access to SRTP keys — zero cryptographic access.
+VIDEO frames additionally carry a 1-byte cleartext marker BEFORE key_id:
+   0x00 = keyframe   ·   0x01 = delta   (from the encoder's IsKeyFrame())
+This lets the receiver's RTP depacketizer classify frames correctly even
+though the codec bitstream is encrypted. Audio frames carry no marker.
 ```
 
 ## Project Structure
 
 ```
 str0m-e2ee/
+├── README.md                 # This file
+├── config.json               # Unified config for all apps (JSONC, sectioned)
+├── config-loader.js          # Shared Node.js config loader (client + KD)
+├── run-all.ps1               # Launch SFU + KD + two clients from config
+│
 ├── docs/
 │   ├── architecture.md       # Detailed architecture document with diagrams
-│   └── plan.md               # Implementation plan and task tracking
-├── README.md                 # This file
+│   ├── plan.md               # Implementation plan and task tracking
+│   ├── generate_deck.py      # Generator for the architecture slide deck
+│   └── E2EE-Architecture.pptx # Architecture overview deck (15 slides)
+│
+├── key-distributor/          # PERC Key Distributor (Node.js)
+│   ├── server.js             # HTTP + WebSocket API (key distribution)
+│   ├── conference.js         # Conference / endpoint management, rekey
+│   ├── keys.js               # AES Key Wrap, EKT tags, key generation
+│   └── test.js               # Unit tests
 │
 ├── client/                   # Native C++ client (libwebrtc + Node.js CLI)
-│   ├── src/                  # C++ source (webrtc_core.cc, addon.cc, etc.)
-│   ├── client.js             # Node.js CLI with P2P and SFU tunnel modes
+│   ├── src/
+│   │   ├── webrtc_core.cc        # libwebrtc PeerConnection (clang-cl ABI)
+│   │   ├── e2ee_transformer.cc/h # Inner AES-128-GCM frame transformer
+│   │   ├── log_util.h            # Shared file/stderr logging helper
+│   │   └── ...
+│   ├── client.js             # Node.js CLI (P2P, SFU tunnel, PERC modes)
 │   ├── build.bat             # Build script (clang-cl + lld-link)
-│   └── package.json          # npm dependencies
+│   └── package.json
 │
 ├── webrtc/                   # WebRTC source checkout (not committed, ~20GB)
-│   ├── depot_tools/          # Chromium build tools (git clone)
-│   └── src/                  # Chromium WebRTC with build output
-│       └── out/release_x64/  # webrtc.lib (330MB)
+│   └── src/out/release_x64/  # webrtc.lib (~330MB)
 │
-└── str0m/                    # str0m WebRTC library (Rust, git submodule)
+└── str0m/                    # str0m WebRTC library (Rust)
     ├── examples/
-    │   ├── e2ee_tunnel.rs    # Tunnel-mode SFU (DTLS passthrough)
-    │   ├── chat.rs           # Original SFU example (non-E2EE)
-    │   └── ...
-    └── src/                  # str0m library source (tunnel mode additions)
+    │   ├── e2ee_perc.rs      # PERC SFU (Phase 2 — HBH SRTP + E2E forwarding)
+    │   ├── e2ee_tunnel.rs    # Tunnel SFU (Phase 1 — DTLS passthrough)
+    │   └── util/mod.rs       # Shared example util + config loader
+    └── src/
+        └── rtp/ohb.rs        # Original Header Block (RFC 8723) module
 ```
 
 ## Prerequisites
@@ -85,20 +117,23 @@ str0m-e2ee/
 | **Windows** | 10/11 | Native client platform |
 | **Visual Studio** | 2022+ | C++ desktop development workload |
 | **Rust** | ≥ 1.81.0 | `rustup update stable` |
-| **Node.js** | ≥ 18 | Native client CLI |
+| **Node.js** | ≥ 18 | Client CLI + Key Distributor |
 | **Git** | any | Submodules + depot_tools |
 | **~20 GB disk** | | WebRTC source + build output |
 | **Network** | LAN | Clients must reach the SFU IP |
 
-> Use the `wincrypto` feature for str0m to avoid cmake/OpenSSL dependency on Windows.
+> Use the `wincrypto` feature for str0m to avoid a cmake/OpenSSL dependency on Windows.
 
 ## Building
 
-### 1. Build and run the Tunnel SFU
+### 1. Build the SFU
 
 ```bash
 cd str0m
-cargo run --example e2ee_tunnel --no-default-features --features "wincrypto,examples"
+# Phase 2 — PERC SFU (recommended)
+cargo build --example e2ee_perc --no-default-features --features "wincrypto,examples"
+# Phase 1 — Tunnel SFU
+cargo build --example e2ee_tunnel --no-default-features --features "wincrypto,examples"
 ```
 
 ### 2. Set up WebRTC (one-time, ~1 hour)
@@ -148,83 +183,207 @@ build.bat
 ```
 
 `build.bat` uses Chromium's bundled `clang-cl` and `lld-link` (from the WebRTC
-checkout) to compile the native addon, linking against `webrtc.lib` and libc++.
-Output: `build/Release/webrtc_addon.node`.
+checkout) to compile the native addon, linking against `webrtc.lib`, libc++, and
+`bcrypt.lib`. Output: `build/Release/webrtc_addon.node`.
 
-### 4. Run two clients
-
-Open **3 terminals** (1 for SFU, 2 for clients):
+### 4. Install Key Distributor deps
 
 ```bash
-# Terminal 1: SFU (already running from step 1)
-
-# Terminal 2: Client A
-cd client
-node client.js
-> connect-sfu alice https://192.168.x.x:3000
-
-# Terminal 3: Client B
-cd client
-node client.js
-> connect-sfu bob https://192.168.x.x:3000
+cd key-distributor
+npm install
 ```
 
-Client A creates a room and waits; Client B joins and both receive the peer's
-SDP answer with swapped DTLS fingerprints. DTLS handshake happens end-to-end
-through the SFU tunnel.
+## Running (PERC mode)
+
+All apps read the shared `config.json` (see [Configuration](#configuration)). Defaults like
+the SFU URL, KD URL, and media parameters live there, so commands stay short.
+
+### Quick start — launch everything
+
+```powershell
+# From the project root: starts SFU + Key Distributor + two client windows
+.\run-all.ps1
+```
+
+Then, in each client window:
+
+```
+> connect-perc alice
+> connect-perc bob
+```
+
+> Running two clients on one machine? Set `media.video.synthetic: true` in `config.json`
+> (a single webcam can only be opened by the first process).
+
+### Manual start — 4 terminals
+
+```bash
+# Terminal 1: PERC SFU
+cd str0m
+cargo run --example e2ee_perc --no-default-features --features "wincrypto,examples" -- --config ..\config.json
+
+# Terminal 2: Key Distributor
+cd key-distributor
+node server.js --config ..\config.json
+
+# Terminal 3: Client A
+cd client
+node client.js --config ..\config.json
+> connect-perc alice
+
+# Terminal 4: Client B
+cd client
+node client.js --config ..\config.json
+> connect-perc bob
+```
+
+`connect-perc <name> [sfu-url] [kd-url] [conf-id]` joins the conference on the Key
+Distributor (obtaining the E2E key), then sends an SDP offer to the SFU. Two clients sharing
+the same `conf-id` exchange E2E keys and can decrypt each other's media. URLs and conf-id
+default to the values in `config.json`.
+
+Other useful client commands: `rekey` (request a key rotation), `status`, `videoinfo`,
+`audioinfo`, `disconnect`, `quit`.
+
+## Configuration
+
+All three apps load one unified, optional configuration with identical resolution logic:
+
+```
+1. --config <path>   repeatable CLI flag; later files deep-merge over earlier
+2. E2EE_CONFIG        env var (one path, or ';'-separated list)
+3. ./config.json then ../config.json   (default search)
+```
+
+- **Sectioned or flat:** a combined file has `sfu` / `keyDistributor` / `client` sections
+  plus shared `logging` / `stats` / `diagnostics`. A flat file (no known section) is used
+  as-is for that app — ideal for shipping one host-specific file per machine.
+- **JSONC:** `//` and `/* */` comments and trailing commas are supported.
+- Node apps share `config-loader.js`; the str0m example uses a matching loader in
+  `examples/util/mod.rs` (no new dependencies).
+
+Common settings: SFU bind host/ports and log level; KD port; client `sfuUrl`/`kdUrl`/
+`confId`, `autoConnect`, video `codec`/`width`/`height`/`fps`/`maxBitrateKbps`/`synthetic`;
+shared log-to-file, stats, and verbose diagnostics toggles. See the comments in
+`config.json` for the full reference (including a table of common video resolutions).
 
 ## How It Works
 
-### Tunnel SFU (`e2ee_tunnel.rs`)
+### PERC SFU (`e2ee_perc.rs`)
 
-Uses str0m's **tunnel mode** (`set_tunnel_mode(true)`):
-- Only terminates ICE (STUN binding requests/responses)
-- DTLS, RTP, RTCP packets are emitted as `Event::TunnelData` and forwarded opaquely
-- SDP fingerprint swapping: each client gets the peer's DTLS fingerprint in its SDP answer
-- DTLS roles assigned: Client A = passive/server, Client B = active/client
-- The SFU has **zero** cryptographic access — it cannot decrypt payloads or verify auth tags
+Runs str0m in normal DTLS-SRTP + RTP mode (not tunnel mode):
+- Terminates hop-by-hop DTLS-SRTP on each client leg
+- Reads RTP headers (SSRC/PT) to route media within a room
+- Forwards the inner E2E-encrypted payload **unmodified** (no per-packet OHB rewriting)
+- Relays keyframe requests (PLI/FIR) back to the original sender so mid-stream receivers
+  get a keyframe (RTCP terminates per leg, so this relay is required)
 
-### Native Client (`client.js`)
+> Note: an Original Header Block module (RFC 8723) exists at `str0m/src/rtp/ohb.rs` with
+> tests, but the current PERC forwarding path does not rewrite headers, so it is not used
+> on the hot path.
+
+### Key Distributor (`key-distributor/`)
+
+Trusted Node.js service that issues and rotates E2E media keys:
+- `POST /conference`, `POST /:id/join` (returns a key bundle), `POST /:id/leave`
+- WebSocket `/ws/endpoint` for real-time key updates and `rekey` notifications
+- Member join/leave (or a `request_rekey`) rotates the KEK and pushes new keys
+- Never sees or relays media
+
+### Native Client (`client.js` + addon)
 
 Node.js CLI wrapping a C++ libwebrtc addon:
-- `connect-sfu <name> <url>` — creates PeerConnection, sends offer to SFU via HTTPS
-- SFU pairs two clients, swaps fingerprints, returns SDP answers
-- DTLS handshake completes end-to-end through the tunnel
-- Audio/video flow encrypted with SRTP keys negotiated directly between peers
+- `connect-perc` joins the conference, installs the E2E key (`installE2eeKey`), and offers
+  to the SFU
+- The E2EE frame transformer applies/strips the inner AES-128-GCM layer (and the VP8
+  keyframe marker) around the normal RTP pipeline
+- Local preview + remote video windows; two-way encrypted audio and video
 
 ## Security Properties
 
-| Property | Status | Mechanism |
-|----------|--------|-----------|
-| Media confidentiality | ✅ | DTLS-SRTP end-to-end (payload encrypted) |
-| Media integrity | ✅ | SRTP authentication tag (HMAC-SHA1-80) |
-| Anti-replay | ✅ | SRTP sequence number / replay list |
-| Forward secrecy | ✅ | DTLS PFS (ECDHE key exchange) |
-| SFU zero-trust | ✅ | Full tunnel — SFU has no SRTP keys |
-| Header visibility | ⚠️ | RTP headers are cleartext per SRTP spec; SFU doesn't parse them in tunnel mode |
+| Property | Tunnel (Phase 1) | PERC (Phase 2) | Mechanism |
+|----------|:---:|:---:|-----------|
+| Media confidentiality | ✅ | ✅ | DTLS-SRTP (tunnel) / inner AES-128-GCM E2E (PERC) |
+| Media integrity | ✅ | ✅ | SRTP auth tag / GCM tag |
+| Forward secrecy (transport) | ✅ | ✅ | DTLS PFS (ECDHE) |
+| SFU has no media keys | ✅ | ✅ | Tunnel: no SRTP keys · PERC: no E2E key |
+| SFU reads media payload | ❌ never | ❌ never | Inner layer sealed in PERC |
+| SFU reads RTP routing headers | ❌ (opaque) | ⚠️ yes (for routing) | Per-leg HBH SRTP in PERC |
+| Metadata (size/timing) | ⚠️ visible | ⚠️ visible | Inherent to relayed media |
+
+## Roadmap — Phase 3: Multi-Party (N:N)
+
+The verified system today handles **1:1 PERC rooms**. The next phase extends it to
+conferences of N participants **without changing the encryption model** — each sender still
+encrypts once with its own E2E key, and the SFU still never decrypts media. The work is in
+routing to many receivers, distributing every sender's key to every receiver, and handling
+participants joining/leaving.
+
+| Step | Goal |
+|------|------|
+| **T11 — SFU multi-party room model** | Replace the A/B role pairing with an N-participant roster; fan out each sender's media to all other participants; track origin endpoint per SSRC. |
+| **T12 — Dynamic receive slots** | Give each receiver an audio+video slot per remote sender, via a pre-allocated transceiver pool (simple) or SDP renegotiation on join/leave (flexible). |
+| **T13 — Per-sender keyframe routing** | Relay each PLI/FIR to the specific origin sender (by SSRC↔sender map) instead of the current opposite-role broadcast. |
+| **T14 — KD multi-key distribution** | Distribute every participant's E2E key to every endpoint, plus a roster + SSRC↔endpoint association, pushed over WebSocket on membership change. |
+| **T15 — Client multi-stream + multi-key** | Install a map of E2E keys keyed by sender; select the decrypt key by incoming SSRC; render N video tiles and mix N audio streams. |
+| **T16 — Membership churn & rekey** | Join/leave mid-conference with KEK rotation propagated to all endpoints; forward secrecy on leave; late joiners get a keyframe to start decoding. |
+| **T17 — Bandwidth & media optimization** (stretch) | Simulcast/SVC layer selection, active-speaker-only forwarding, and per-receiver BWE to scale beyond a handful of participants. |
+
+```
+  T11 ──► T12 ──► T13
+  T14 ──► T15
+  T11, T15 ──► T16
+  T16 ──► T17 (optional)
+```
+
+See [`docs/plan.md`](docs/plan.md) for the detailed Phase 3 plan, the 1:1 assumptions to
+remove, and open design questions (receive-slot strategy, conference-size target,
+key-to-stream binding, RTCP fan-out, and per-`Rtc` CPU cost).
+
+### Longer-term
+
+- **RFC 8723 at the SRTP layer** — move the inner layer into SRTP double-encryption proper
+  (vs. the current frame-transformer approach).
+- **EKT (RFC 8870)** — piggyback E2E key transport on SRTP instead of a side channel.
+- **RFC 9185 DTLS tunnel (KD↔SFU)** — replace the HTTP/WebSocket key channel.
+- **Certificate pinning** — pin DTLS certificates to user identity.
+- **Encrypted header extensions (Cryptex)** — hide remaining RTP metadata from the SFU.
+- **MLS (Messaging Layer Security)** — formal group key agreement for post-compromise security.
 
 ## Troubleshooting
 
 **`clang-cl not found` during build:**
-WebRTC must be checked out at `webrtc/src/` relative to the project root. The build
-script expects Chromium's clang-cl at `webrtc/src/third_party/llvm-build/Release+Asserts/bin/`.
+WebRTC must be checked out at `webrtc/src/`. The build script expects Chromium's clang-cl at
+`webrtc/src/third_party/llvm-build/Release+Asserts/bin/`.
 
 **`node.lib not found` during build:**
-Run `npx node-gyp install` to download Node.js headers and library for native addon compilation.
+Run `npx node-gyp install` to download Node.js headers and library.
+
+**Link error / "permission denied" on `webrtc_addon.node`:**
+A running `node client.js` holds the addon. Close all client processes before rebuilding.
+
+**SFU example fails to link:**
+A running `e2ee_perc.exe` locks the binary. Stop it (`Stop-Process -Id <pid>`) before rebuild.
+
+**Receiver shows black video / endless PLIs:**
+Ensure both clients run the current build — the 1-byte VP8 keyframe marker and the SFU
+keyframe relay are required for video to start decoding.
 
 **Socket error 10060 (TimedOut) on Windows:**
 Benign — Windows surfaces ICMP "destination unreachable" on UDP sockets. Already handled.
 
 ## Further Reading
 
-- [`docs/architecture.md`](docs/architecture.md) — Full architecture document with detailed diagrams
+- [`docs/architecture.md`](docs/architecture.md) — Full architecture document with diagrams
+- [`docs/E2EE-Architecture.pptx`](docs/E2EE-Architecture.pptx) — Architecture overview deck
 - [`docs/plan.md`](docs/plan.md) — Implementation plan and task tracking
 - [str0m documentation](https://docs.rs/str0m) — str0m WebRTC library docs
-- [RFC 8723 — PERC Double Encryption](https://datatracker.ietf.org/doc/html/rfc8723) — Double encryption framework
-- [RFC 8871 — DTLS Tunnel](https://datatracker.ietf.org/doc/html/rfc8871) — DTLS tunnel between endpoints via MDD
-- [RFC 3711 — SRTP](https://datatracker.ietf.org/doc/html/rfc3711) — Secure Real-time Transport Protocol
+- [RFC 8871 — PERC Solution Framework](https://datatracker.ietf.org/doc/html/rfc8871)
+- [RFC 8723 — PERC Double Encryption](https://datatracker.ietf.org/doc/html/rfc8723)
+- [RFC 8870 — EKT for SRTP](https://datatracker.ietf.org/doc/html/rfc8870)
+- [RFC 3711 — SRTP](https://datatracker.ietf.org/doc/html/rfc3711)
 
 ---
 
 > **Note:** This project (code, documentation, and architecture) was mostly generated
-> by Claude Opus (Anthropic) via GitHub Copilot CLI, with human guidance and review.
+> by Claude (Anthropic) via GitHub Copilot CLI, with human guidance and review.

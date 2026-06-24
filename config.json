@@ -1,0 +1,115 @@
+// =============================================================================
+//  E2EE WebRTC — unified configuration
+// =============================================================================
+//  This single file configures all three apps:
+//      • sfu             — the str0m PERC SFU         (str0m/examples/e2ee_perc.rs)
+//      • keyDistributor  — the PERC Key Distributor   (key-distributor/server.js)
+//      • client          — the native test client     (client/client.js)
+//
+//  HOW IT IS LOADED (identical logic in every app):
+//    1. --config <path>   CLI flag. Repeatable: later files deep-merge over
+//                         earlier ones, e.g.
+//                             --config config.json --config prod.overrides.json
+//    2. E2EE_CONFIG        env var (one path, or ';'-separated list) if no flag.
+//    3. ./config.json then the repo-root config.json, if neither is given.
+//
+//  SECTIONED *or* FLAT — same parser:
+//    • Single machine: keep everything here; each app reads its own section
+//      (sfu / keyDistributor / client) plus the shared sections below.
+//    • Distributed:    ship each host a file containing ONLY that app's keys at
+//      the top level (no section wrapper). The loader detects the absence of a
+//      known section and treats the whole file as that app's config.
+//
+//  Comments (//, /* */) and trailing commas are allowed (JSONC).
+// =============================================================================
+{
+  // ---------------------------------------------------------------------------
+  //  SFU — str0m PERC SFU (hop-by-hop SRTP only; never sees E2EE media/keys)
+  // ---------------------------------------------------------------------------
+  "sfu": {
+    "httpHost": "0.0.0.0",   // HTTP signaling bind host
+    "httpPort": 3000,        // HTTP signaling port (POST /offer, GET /answer)
+    "udpPort": 0,            // Media UDP port (0 = OS-assigned random)
+    "logLevel": "info",      // error | warn | info | debug | trace
+    "statsIntervalSec": 5,   // periodic "forwarded RTP" stats interval
+    "diagnostics": {
+      "wireLog": false       // log distinct (ssrc, pt) seen on the raw wire
+    }
+  },
+
+  // ---------------------------------------------------------------------------
+  //  Key Distributor — issues E2EE keys to authorized conference participants
+  // ---------------------------------------------------------------------------
+  "keyDistributor": {
+    "port": 4000,
+    "logLevel": "info"       // debug emits verbose per-request logs
+  },
+
+  // ---------------------------------------------------------------------------
+  //  Client — native libwebrtc test client (Node.js CLI)
+  // ---------------------------------------------------------------------------
+  "client": {
+    "sfuUrl": "https://localhost:3000",
+    "kdUrl": "http://localhost:4000",
+    "confId": "default",         // peers sharing a confId exchange E2EE keys
+
+    "autoConnect": false,        // launch straight into PERC mode (no prompt)
+    "autoConnectName": "",       // name to use when autoConnect is true
+
+    "media": {
+      "video": {
+        "codec": "VP8",          // VP8 | VP9 | H264 | AV1 (all compiled in)
+
+        // ---- Resolution -------------------------------------------------
+        //  Common sizes (width x height — name):
+        //     320 x 240  — QVGA
+        //     640 x 480  — VGA            (default)
+        //     854 x 480  — FWVGA / 480p widescreen
+        //     960 x 540  — qHD
+        //    1280 x 720  — HD / 720p
+        //    1920 x 1080 — FHD / 1080p
+        //    2560 x 1440 — QHD / 1440p
+        //    3840 x 2160 — UHD / 4K
+        "width": 640,
+        "height": 480,
+
+        "fps": 30,               // capture/encode frame rate
+        "maxBitrateKbps": 1000,  // encoder target ceiling (0 = leave to WebRTC)
+
+        // Use an animated synthetic source instead of a camera. Required when
+        // running two clients on one machine (a single webcam can only be
+        // opened by the first process).
+        "synthetic": false
+      },
+      "audio": {
+        "codec": "opus"          // opus (others negotiated if offered)
+      }
+    },
+
+    "e2ee": {
+      "rekeyOnCommand": true     // enable the interactive `rekey` test command
+    }
+  },
+
+  // ===========================================================================
+  //  SHARED sections — read by every app, overridable per-app via deep-merge
+  // ===========================================================================
+
+  // File logging. When enabled, each app tees its console output to a file.
+  "logging": {
+    "toFile": false,             // also write logs to a file
+    "dir": "log",                // directory for log files (created if absent)
+    "timestamped": true          // e.g. log/alice_2026-06-24_14-22-05.log
+  },
+
+  // Periodic statistics (forwarded RTP, encrypt/decrypt counts, fps, bitrate…)
+  "stats": {
+    "enabled": true,
+    "intervalSec": 5
+  },
+
+  // Verbose, opt-in diagnostics. Off by default to keep normal runs quiet.
+  "diagnostics": {
+    "e2eeFrameLog": false        // per-SSRC SEND/RECV frame + keyframe logging
+  }
+}

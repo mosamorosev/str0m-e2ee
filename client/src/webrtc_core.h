@@ -37,6 +37,13 @@ int webrtc_add_ice_candidate(WebrtcPeer* peer, const char* sdp_mid,
                              int sdp_mline_index, const char* candidate);
 void webrtc_close(WebrtcPeer* peer);
 
+// E2EE key management (PERC Phase 2)
+// key_id: single-byte key identifier
+// key: raw AES-128-GCM key (16 bytes)
+// key_len: must be 16
+int webrtc_install_e2ee_key(WebrtcPeer* peer, int key_id,
+                            const unsigned char* key, int key_len);
+
 // Event polling - caller must free returned events with webrtc_free_events
 int webrtc_poll_events(WebrtcPeer* peer, WebrtcEvent** out_events,
                        int* out_count);

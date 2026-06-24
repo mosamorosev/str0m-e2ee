@@ -20,6 +20,8 @@ Napi::Object PeerConnectionWrapper::Init(Napi::Env env,
           InstanceMethod("pollEvents", &PeerConnectionWrapper::PollEvents),
           InstanceMethod("getAudioInfo", &PeerConnectionWrapper::GetAudioInfo),
           InstanceMethod("getVideoInfo", &PeerConnectionWrapper::GetVideoInfo),
+          InstanceMethod("installE2eeKey",
+                         &PeerConnectionWrapper::InstallE2eeKey),
       });
   exports.Set("PeerConnection", func);
   return exports;
@@ -141,4 +143,22 @@ Napi::Value PeerConnectionWrapper::GetVideoInfo(const Napi::CallbackInfo& info) 
   Napi::String result = Napi::String::New(env, json ? json : "{}");
   if (json) free(json);
   return result;
+}
+
+Napi::Value PeerConnectionWrapper::InstallE2eeKey(
+    const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsBuffer()) {
+    Napi::TypeError::New(env, "Expected (keyId: number, key: Buffer)")
+        .ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
+  int key_id = info[0].As<Napi::Number>().Int32Value();
+  auto buf = info[1].As<Napi::Buffer<unsigned char>>();
+  int rc = -1;
+  if (peer_) {
+    rc = webrtc_install_e2ee_key(peer_, key_id, buf.Data(),
+                                 static_cast<int>(buf.Length()));
+  }
+  return Napi::Number::New(env, rc);
 }

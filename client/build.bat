@@ -30,10 +30,13 @@ if not exist "%NAPI_DIR%\napi.h" echo ERROR: napi.h not found. Run "npm install"
 if not exist build\Release mkdir build\Release
 
 REM Common flags for clang-cl (libc++ ABI matching webrtc.lib)
-set WEBRTC_CFLAGS=/c /MT /O2 /std:c++20 /EHsc /Zc:__cplusplus -Wno-everything -DNDEBUG -DWEBRTC_WIN -DNOMINMAX -DWIN32_LEAN_AND_MEAN -DWEBRTC_USE_H264 -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE -DCR_LIBCXX_REVISION=0 -D_LIBCPP_NO_AUTO_LINK -D_LIBCPP_NO_ABI_TAG -D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS -I"%WEBRTC_SRC%\buildtools\third_party\libc++" -I"%WEBRTC_SRC%\third_party\libc++\src\include" -I"%WEBRTC_SRC%" -I"%WEBRTC_SRC%\third_party\abseil-cpp" -I"%WEBRTC_SRC%\third_party\libyuv\include"
+set WEBRTC_CFLAGS=/c /MT /O2 /Z7 /std:c++20 /EHsc /Zc:__cplusplus -Wno-everything -DNDEBUG -DWEBRTC_WIN -DNOMINMAX -DWIN32_LEAN_AND_MEAN -DWEBRTC_USE_H264 -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE -DCR_LIBCXX_REVISION=0 -D_LIBCPP_NO_AUTO_LINK -D_LIBCPP_NO_ABI_TAG -D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS -I"%WEBRTC_SRC%\buildtools\third_party\libc++" -I"%WEBRTC_SRC%\third_party\libc++\src\include" -I"%WEBRTC_SRC%" -I"%WEBRTC_SRC%\third_party\abseil-cpp" -I"%WEBRTC_SRC%\third_party\libyuv\include"
 
 echo Compiling webrtc_core.cc ...
 "%CLANG_CL%" %WEBRTC_CFLAGS% /Fosrc\webrtc_core.obj src\webrtc_core.cc || goto :fail
+
+echo Compiling e2ee_transformer.cc ...
+"%CLANG_CL%" %WEBRTC_CFLAGS% /Fosrc\e2ee_transformer.obj src\e2ee_transformer.cc || goto :fail
 
 echo Compiling test_video_capturer.cc ...
 "%CLANG_CL%" %WEBRTC_CFLAGS% /Fosrc\test_video_capturer.obj "%WEBRTC_SRC%\test\test_video_capturer.cc" || goto :fail
@@ -48,7 +51,7 @@ echo Compiling peer_connection_wrapper.cc ...
 "%CLANG_CL%" /c /MT /O2 /std:c++20 /EHsc /Zc:__cplusplus -Wno-everything -DNAPI_VERSION=8 -DNAPI_DISABLE_CPP_EXCEPTIONS -DWEBRTC_WIN -DNOMINMAX -DWIN32_LEAN_AND_MEAN -DWEBRTC_USE_H264 -DNODE_GYP_MODULE_NAME=webrtc_addon -DUSING_UV_SHARED=1 -DUSING_V8_SHARED=1 -DV8_DEPRECATION_WARNINGS=1 -I"%NODE_INC%" -I"%NAPI_DIR%" -I"src" /Fosrc\peer_connection_wrapper.obj src\peer_connection_wrapper.cc || goto :fail
 
 echo Linking webrtc_addon.node ...
-"%LLD_LINK%" /DLL /OUT:build\Release\webrtc_addon.node /MACHINE:X64 /FORCE:MULTIPLE src\webrtc_core.obj src\test_video_capturer.obj src\vcm_capturer.obj src\addon.obj src\peer_connection_wrapper.obj "%WEBRTC_SRC%\out\release_x64\obj\webrtc.lib" "%WEBRTC_SRC%\out\release_x64\obj\buildtools\third_party\libc++\libc++\*.obj" "%NODE_LIB%" winmm.lib secur32.lib iphlpapi.lib dmoguids.lib wmcodecdspuuid.lib strmiids.lib msdmo.lib ole32.lib crypt32.lib ws2_32.lib amstrmid.lib d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib shell32.lib libcmt.lib libvcruntime.lib libucrt.lib delayimp.lib /DELAYLOAD:node.exe || goto :fail
+"%LLD_LINK%" /DLL /DEBUG /OUT:build\Release\webrtc_addon.node /MACHINE:X64 /FORCE:MULTIPLE src\webrtc_core.obj src\e2ee_transformer.obj src\test_video_capturer.obj src\vcm_capturer.obj src\addon.obj src\peer_connection_wrapper.obj "%WEBRTC_SRC%\out\release_x64\obj\webrtc.lib" "%WEBRTC_SRC%\out\release_x64\obj\buildtools\third_party\libc++\libc++\*.obj" "%NODE_LIB%" winmm.lib secur32.lib iphlpapi.lib dmoguids.lib wmcodecdspuuid.lib strmiids.lib msdmo.lib ole32.lib crypt32.lib ws2_32.lib amstrmid.lib d3d11.lib dxgi.lib advapi32.lib user32.lib gdi32.lib shell32.lib bcrypt.lib dbghelp.lib libcmt.lib libvcruntime.lib libucrt.lib delayimp.lib /DELAYLOAD:node.exe || goto :fail
 
 echo.
 echo === Build successful! ===

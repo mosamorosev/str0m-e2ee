@@ -3,19 +3,37 @@
 ## 1. System Overview
 
 This document describes the architecture of an end-to-end encrypted (E2EE) WebRTC
-conferencing system built on a DTLS tunnel mode SFU.
+conferencing system built on a zero-trust SFU.
 
 **Components:**
-- **SFU** — Rust server built on [str0m](https://github.com/algesten/str0m) in tunnel mode (only terminates ICE)
-- **Native Client** — C++ libwebrtc addon with Node.js CLI
+- **SFU** — Rust server built on [str0m](https://github.com/algesten/str0m). Two modes:
+  - *Tunnel mode* (Phase 1) — terminates only ICE, forwards DTLS/SRTP/SRTCP opaquely (1:1).
+  - *PERC double-encryption mode* (Phase 2, **implemented**) — terminates hop-by-hop
+    DTLS-SRTP per leg, reads RTP headers for routing, forwards the inner end-to-end
+    encrypted payload untouched (`examples/e2ee_perc.rs`).
+- **Key Distributor (KD)** — Node.js service that issues end-to-end (E2E) media keys to
+  authorized conference participants (`key-distributor/`).
+- **Native Client** — C++ libwebrtc addon with Node.js CLI (`client/`).
 
-The core security property: **the SFU never has access to media content or encryption
-keys.** It acts purely as an ICE relay, forwarding DTLS, SRTP, and SRTCP packets between
-two clients as opaque bytes. Compromise of the SFU infrastructure reveals only traffic
-metadata (packet sizes and timing).
+The core security property: **the SFU never has access to media content or the E2E
+encryption keys.** In tunnel mode it is a pure ICE relay; in PERC mode it terminates only
+the hop-by-hop (HBH) SRTP for routing while the inner E2E-encrypted media payload stays
+opaque. Compromise of the SFU reveals only traffic metadata (packet sizes and timing) and
+RTP routing headers.
 
-This approach is inspired by [RFC 8871 (PERC DTLS Tunnel)](https://datatracker.ietf.org/doc/html/rfc8871)
+This approach is inspired by [RFC 8871 (PERC Solution Framework)](https://datatracker.ietf.org/doc/html/rfc8871)
 and [RFC 8723 (PERC Double Encryption)](https://datatracker.ietf.org/doc/html/rfc8723).
+
+### 1.1 Implementation Status
+
+| Phase | Mode | Status |
+|-------|------|--------|
+| Phase 1 | 1:1 DTLS-SRTP tunnel (SFU relays opaque packets) | ✅ Verified |
+| Phase 2 | PERC double encryption (HBH SFU + frame-level E2E + Key Distributor) | ✅ Verified — encrypted audio **and** video flow end-to-end |
+
+Sections 2–9 document the **tunnel mode** design. Section 10 documents the **PERC
+double-encryption mode** that is now the primary, verified implementation. Section 11
+documents the **unified configuration system** shared by all three apps.
 
 ---
 
@@ -487,17 +505,199 @@ happens end-to-end between clients, so SRTP keys are shared only between them.
 
 ---
 
-## 10. Future Work
+## 10. PERC Double-Encryption Mode (Implemented)
 
-### Near-term (Phase 2 — PERC Double Encryption)
+Phase 2 replaces the opaque DTLS tunnel with a true **PERC double-encryption** pipeline.
+Unlike tunnel mode, the SFU *does* terminate hop-by-hop (HBH) DTLS-SRTP on each leg — so it
+can read RTP headers and route by SSRC — but the media payload carries a **second, inner
+end-to-end (E2E) encryption layer** that the SFU never has keys for.
 
-- **Key Distributor Service (KD)** — Node.js service implementing RFC 8723 key distribution for multi-party
-- **Double Encryption in str0m** — Implement inner/outer key separation (RFC 8723): SFU strips HBH, reads headers, re-applies new HBH per receiver
-- **PERC-capable Native Client** — libwebrtc modifications for double-encrypted SRTP
+```
+        E2E key (shared by participants, via Key Distributor)
+        │                                              │
+        ▼                                              ▼
+┌────────────┐   HBH key A        ┌───────────┐   HBH key B   ┌────────────┐
+│  Client A  │  (DTLS-SRTP A)     │    SFU    │ (DTLS-SRTP B) │  Client B  │
+│            │───────────────────►│  (PERC)   │──────────────►│            │
+│ 1 E2E enc  │  outer = HBH A     │ strip HBH │  outer = HBH B│ strip HBH B│
+│ 2 HBH enc  │  inner = E2E       │ read hdrs │  inner = E2E  │ strip E2E  │
+└────────────┘                    │ re-HBH    │               └────────────┘
+                                  └───────────┘
+   SFU sees: RTP headers (SSRC/PT/seq/ts) for routing.
+   SFU NEVER sees: the E2E key or the decrypted media (inner layer stays sealed).
+```
+
+### 10.1 Roles
+
+| Component | Trust | Responsibility |
+|-----------|-------|----------------|
+| **Key Distributor (KD)** | Trusted | Issues/rotates the E2E media key to authenticated participants. Never talks media. |
+| **SFU (str0m PERC)** | Untrusted for secrecy | Terminates HBH SRTP per leg, routes by SSRC, forwards inner E2E payload unmodified, relays RTCP/PLI. |
+| **Client** | Trusted | Applies the inner E2E layer (encrypt on send / decrypt on receive) via a libwebrtc frame transformer, using keys from the KD. |
+
+### 10.2 Key Distribution Flow
+
+```
+ Client A                 Key Distributor (KD)              Client B
+    │                            │                               │
+    │── POST /conference ───────►│  create conference            │
+    │── POST /:id/join ─────────►│  generate E2E master key      │
+    │◄── key bundle ─────────────│  (KEK, e2eMasterKey, kekSpi)  │
+    │── WS /ws/endpoint ────────►│  realtime key updates         │
+    │                            │◄──────── POST /:id/join ──────│
+    │                            │  rotate KEK, notify members   │
+    │◄─── WS "rekey" ────────────│──────── WS "rekey" ──────────►│
+    │  install new E2E key       │          install new E2E key  │
+```
+
+- The E2E key is installed into the native addon via `pc.installE2eeKey(keyId, keyBuf)`.
+- `kekSpi` becomes the on-wire **key_id** so receivers select the right key/epoch.
+- Membership changes rotate the KEK; the `rekey` REPL command (or `request_rekey` WS
+  message) triggers a rotation on demand.
+
+### 10.3 Inner E2E Frame Format
+
+The inner layer is applied at the **encoded-frame** boundary (libwebrtc
+`FrameTransformerInterface`), independent of the codec bitstream. AES-128-GCM, empty AAD:
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                  Inner E2E payload (per frame)                   │
+│                                                                  │
+│  [key_id : 1B] [IV : 12B] [ ciphertext : N ] [GCM tag : 16B]     │
+│                                                                  │
+│   key_id  — KEK SPI / epoch selector (from the Key Distributor)  │
+│   IV      — SSRC (4B, big-endian) ‖ frame counter (8B)           │
+│   cipher  — AES-128-GCM(plaintext) under the E2E key             │
+│   tag     — 128-bit GCM authentication tag                       │
+│                                                                  │
+│   Fixed overhead kE2eeOverhead = 1 + 12 + 16 = 29 bytes          │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+This inner payload then becomes the *plaintext input* to the normal RTP packetizer and the
+outer HBH SRTP. The SFU forwards it byte-for-byte (no per-packet OHB rewriting).
+
+### 10.4 The VP8 Keyframe Marker (a key subtlety)
+
+Full-frame E2EE hides the codec bitstream from the receiver's RTP **depacketizer**, which
+normally reads the VP8 keyframe "P-bit" from the first payload byte. With the inner format
+above, byte 0 is `key_id` — so every frame would be misclassified (e.g. `key_id=1` ⇒ all
+frames look like delta frames ⇒ the decoder never starts and emits endless PLIs).
+
+**Fix:** the sender prepends a **1-byte cleartext marker** to *video* frames before the
+encrypted payload:
+
+```
+ Video frame on wire:  [ marker : 1B ][ key_id ][ IV ][ ciphertext ][ tag ]
+                          0x00 = keyframe
+                          0x01 = delta frame   (from encoder IsKeyFrame())
+
+ Audio frame on wire:  [ key_id ][ IV ][ ciphertext ][ tag ]   (no marker)
+```
+
+The receiver strips this byte before the key-id check and decryption. This lets the
+depacketizer/jitter buffer classify frames correctly while keeping the actual media sealed.
+
+### 10.5 Keyframe Request (PLI/FIR) Relay
+
+Because the SFU terminates HBH SRTP, RTCP feedback terminates per leg too. A receiver that
+joins mid-stream needs a keyframe, so the SFU **relays** keyframe requests: on
+`Event::KeyframeRequest` from a receiver, it maps the requester back to the sending peer in
+the same room and calls `request_keyframe(kind)` on that sender's video rx stream. Without
+this relay the sender never refreshes and the receiver stays black.
+
+### 10.6 What the SFU Can and Cannot See (PERC mode)
+
+| Visible to SFU | Hidden from SFU |
+|----------------|-----------------|
+| RTP fixed headers (SSRC, PT, seq, timestamp, marker) | E2E media payload (inner AES-128-GCM) |
+| HBH SRTP for its own legs (for routing only) | The E2E key (held only by KD + clients) |
+| The 1-byte VP8 key/delta marker | The decoded media / codec bitstream |
+| Packet sizes and timing | Header extensions on the inner layer |
+
+---
+
+## 11. Configuration System
+
+All three apps (SFU, Key Distributor, client) read one **unified, optional** configuration
+with identical resolution logic, so a deployment can use a single combined `config.json` or
+per-host flat files.
+
+```
+Resolution order (first match wins for the path list):
+  1. --config <path>     repeatable CLI flag; later files deep-merge over earlier
+                         (e.g. --config config.json --config prod.overrides.json)
+  2. E2EE_CONFIG         env var (one path, or ';'-separated list)
+  3. ./config.json then ../config.json    (default search)
+```
+
+- **Sectioned or flat (same parser):** a combined file has `sfu` / `keyDistributor` /
+  `client` sections plus shared `logging` / `stats` / `diagnostics`; each app extracts its
+  own section merged with the shared ones. A flat file (no known section) is used as-is for
+  that app — ideal for distributing one host-specific file per machine.
+- **JSONC:** `//` and `/* */` comments and trailing commas are supported (string-aware
+  stripper that preserves URLs like `http://`).
+- **No new dependencies:** Node apps share `config-loader.js`; the str0m example uses a
+  matching loader in `examples/util/mod.rs` (serde_json was already available).
+
+```
+                         config.json  (JSONC, sectioned)
+                                │
+        ┌───────────────────────┼─────────────────────────┐
+        ▼                       ▼                         ▼
+   sfu section            keyDistributor             client section
+   + shared               + shared                   + shared
+        │                       │                         │
+        ▼                       ▼                         ▼
+  e2ee_perc.rs            server.js                  client.js
+  (util::load_config)     (config-loader)            (config-loader)
+        │                                                  │
+        │                              media.* ─► env vars ▼
+        ▼                                  E2EE_VIDEO_WIDTH/HEIGHT/FPS/
+  httpHost/Port, udpPort,                  BITRATE_KBPS, E2EE_SYNTHETIC_VIDEO,
+  logLevel, statsIntervalSec,              E2EE_FRAME_DIAG, E2EE_LOG_FILE
+  diagnostics.wireLog                            │
+                                                 ▼
+                                          webrtc_core.cc / e2ee_transformer.cc
+```
+
+**Key settings:**
+
+| Section | Setting | Effect |
+|---------|---------|--------|
+| `sfu` | `httpHost`/`httpPort`/`udpPort` | Signaling + media bind |
+| `sfu` | `logLevel`, `statsIntervalSec` | Tracing level; periodic stats cadence |
+| `sfu` | `diagnostics.wireLog` | Log distinct `(ssrc, pt)` seen on the raw wire |
+| `keyDistributor` | `port`, `logLevel` | KD bind port; verbose logs at `debug` |
+| `client` | `sfuUrl`/`kdUrl`/`confId` | Connection defaults for `connect-perc` |
+| `client` | `autoConnect`/`autoConnectName` | Hands-free PERC start |
+| `client` | `media.video.codec` | SDP-munged preferred codec (VP8/VP9/H264/AV1) |
+| `client` | `media.video.width/height/fps/maxBitrateKbps` | Capture/encode params → env vars |
+| `client` | `media.video.synthetic` | Animated synthetic source (two clients, one machine) |
+| `client` | `e2ee.rekeyOnCommand` | Enable the interactive `rekey` command |
+| shared | `logging.toFile`/`dir`/`timestamped` | Tee console (and native `E2EE_LOG_FILE`) to file |
+| shared | `diagnostics.e2eeFrameLog` | Per-SSRC SEND/RECV frame + keyframe logging |
+
+`run-all.ps1` launches the whole stack (SFU + KD + two clients) each pointed at the shared
+config file.
+
+---
+
+## 12. Future Work
+
+### Completed (Phase 2 — PERC Double Encryption) ✅
+
+- **Key Distributor Service (KD)** — Node.js service issuing/rotating E2E media keys (`key-distributor/`).
+- **Inner E2E encryption** — frame-level AES-128-GCM applied via a libwebrtc frame transformer; SFU forwards the inner payload unmodified while terminating HBH SRTP per leg.
+- **PERC-capable Native Client** — installs E2E keys from the KD, prepends the VP8 keyframe marker, strips/decrypts on receive.
+- **Keyframe (PLI/FIR) relay** in the SFU so mid-stream receivers get a keyframe.
 
 ### Longer-term
 
-- **Multi-party tunnel** — Extend tunnel mode beyond 1:1 to N:N conferences
-- **Certificate pinning** — Pin DTLS certificates to user identity for stronger authentication
-- **Encrypted header extensions (Cryptex)** — hide remaining RTP metadata from SFU
-- **MLS (Messaging Layer Security)** — formal group key agreement for post-compromise security
+- **RFC 8723 at the SRTP layer** — move the inner layer into SRTP double-encryption proper (vs. the current frame-transformer approach).
+- **Multi-party (N:N)** — extend PERC routing beyond 1:1 rooms to full conferences.
+- **EKT (RFC 8870)** — piggyback E2E key transport on SRTP instead of a side channel.
+- **Certificate pinning** — pin DTLS certificates to user identity for stronger authentication.
+- **Encrypted header extensions (Cryptex)** — hide remaining RTP metadata from the SFU.
+- **MLS (Messaging Layer Security)** — formal group key agreement for post-compromise security.

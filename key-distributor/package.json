@@ -1,0 +1,13 @@
+{
+  "name": "perc-key-distributor",
+  "version": "1.0.0",
+  "description": "PERC Key Distributor (KD) service for E2EE WebRTC conferencing (RFC 8871)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js --verbose"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}

@@ -7,10 +7,14 @@
 #include "webrtc_core.h"
 
 #include <cstdio>
+#include <cstdlib>
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <set>
 #include <sstream>
 #include <string>
 #include <functional>
@@ -38,19 +42,139 @@
 #include "api/video_codecs/video_decoder_factory_template_libvpx_vp9_adapter.h"
 #include "api/video_codecs/video_decoder_factory_template_open_h264_adapter.h"
 #include "api/video_codecs/video_decoder_factory_template_dav1d_adapter.h"
+#include "api/rtp_sender_interface.h"
+#include "api/rtp_receiver_interface.h"
 #include "pc/video_track_source.h"
 #include "modules/video_capture/video_capture.h"
 #include "modules/video_capture/video_capture_factory.h"
 #include "test/test_video_capturer.h"
 #include "test/vcm_capturer.h"
+#include "api/video/i420_buffer.h"
+#include "api/video/video_frame.h"
+#include "api/video/video_rotation.h"
+#include "rtc_base/time_utils.h"
 #include "rtc_base/thread.h"
 #include "rtc_base/logging.h"
 #include "third_party/libyuv/include/libyuv.h"
 
-#include <windows.h>
+#include "e2ee_transformer.h"
+#include "log_util.h"
 
-// Simple log macro that outputs to stderr (visible in console)
-#define DEMO_LOG(fmt, ...) fprintf(stderr, "[webrtc_core] " fmt "\n", ##__VA_ARGS__)
+#include <windows.h>
+#include <dbghelp.h>
+
+// Log macro: outputs to stderr and (if E2EE_LOG_FILE is set) to the log file.
+#define DEMO_LOG(fmt, ...) e2ee_log::write("[webrtc_core] ", fmt, ##__VA_ARGS__)
+
+// --- In-process crash handler -------------------------------------------------
+// WER LocalDumps did not reliably capture the crash, so we install our own
+// unhandled-exception filter. On a fault it writes a textual stack trace (module
+// + offset, plus symbol names when a .pdb is available) and a full minidump to
+// the crashdumps/ folder, then lets the process terminate. This works even for
+// faults inside webrtc.lib / libvpx / opus, telling us exactly where it died.
+static LONG WINAPI E2eeCrashFilter(EXCEPTION_POINTERS* ep) {
+  static volatile LONG entered = 0;
+  if (InterlockedExchange(&entered, 1) != 0) return EXCEPTION_EXECUTE_HANDLER;
+
+  CreateDirectoryA("crashdumps", nullptr);
+  DWORD pid = GetCurrentProcessId();
+
+  char txt_path[MAX_PATH];
+  snprintf(txt_path, sizeof(txt_path), "crashdumps\\crash_%lu.txt", pid);
+  FILE* f = fopen(txt_path, "w");
+
+  auto emit = [&](const char* line) {
+    fprintf(stderr, "[crash] %s\n", line);
+    if (f) fprintf(f, "%s\n", line);
+  };
+
+  char buf[512];
+  snprintf(buf, sizeof(buf), "Unhandled exception 0x%08lX at %p",
+           ep->ExceptionRecord->ExceptionCode,
+           ep->ExceptionRecord->ExceptionAddress);
+  emit(buf);
+  if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+      ep->ExceptionRecord->NumberParameters >= 2) {
+    snprintf(buf, sizeof(buf), "Access violation %s address %p",
+             ep->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
+             (void*)ep->ExceptionRecord->ExceptionInformation[1]);
+    emit(buf);
+  }
+
+  HANDLE proc = GetCurrentProcess();
+  SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME | SYMOPT_LOAD_LINES);
+  SymInitialize(proc, nullptr, TRUE);
+
+  CONTEXT* ctx = ep->ContextRecord;
+  STACKFRAME64 frame = {};
+  frame.AddrPC.Offset = ctx->Rip;
+  frame.AddrPC.Mode = AddrModeFlat;
+  frame.AddrFrame.Offset = ctx->Rbp;
+  frame.AddrFrame.Mode = AddrModeFlat;
+  frame.AddrStack.Offset = ctx->Rsp;
+  frame.AddrStack.Mode = AddrModeFlat;
+
+  emit("--- stack ---");
+  for (int i = 0; i < 40; ++i) {
+    if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, GetCurrentThread(), &frame,
+                     ctx, nullptr, SymFunctionTableAccess64, SymGetModuleBase64,
+                     nullptr)) {
+      break;
+    }
+    DWORD64 addr = frame.AddrPC.Offset;
+    if (addr == 0) break;
+
+    char modname[MAX_PATH] = "?";
+    DWORD64 modbase = SymGetModuleBase64(proc, addr);
+    if (modbase) {
+      HMODULE hm = (HMODULE)modbase;
+      GetModuleFileNameA(hm, modname, MAX_PATH);
+    }
+
+    char symbuf[sizeof(SYMBOL_INFO) + 256] = {};
+    SYMBOL_INFO* sym = (SYMBOL_INFO*)symbuf;
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+    sym->MaxNameLen = 255;
+    DWORD64 disp = 0;
+    if (SymFromAddr(proc, addr, &disp, sym)) {
+      snprintf(buf, sizeof(buf), "#%02d %p %s+0x%llx  [%s]", i, (void*)addr,
+               sym->Name, (unsigned long long)disp, modname);
+    } else {
+      snprintf(buf, sizeof(buf), "#%02d %p (+0x%llx)  [%s]", i, (void*)addr,
+               (unsigned long long)(addr - (modbase ? modbase : addr)), modname);
+    }
+    emit(buf);
+  }
+
+  if (f) fclose(f);
+
+  // Full minidump for offline analysis.
+  char dmp_path[MAX_PATH];
+  snprintf(dmp_path, sizeof(dmp_path), "crashdumps\\crash_%lu.dmp", pid);
+  HANDLE hFile = CreateFileA(dmp_path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (hFile != INVALID_HANDLE_VALUE) {
+    MINIDUMP_EXCEPTION_INFORMATION mei = {};
+    mei.ThreadId = GetCurrentThreadId();
+    mei.ExceptionPointers = ep;
+    mei.ClientPointers = FALSE;
+    MiniDumpWriteDump(proc, pid, hFile,
+                      (MINIDUMP_TYPE)(MiniDumpWithFullMemory |
+                                      MiniDumpWithHandleData),
+                      &mei, nullptr, nullptr);
+    CloseHandle(hFile);
+  }
+
+  fflush(stderr);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void InstallCrashHandler() {
+  static bool installed = false;
+  if (installed) return;
+  installed = true;
+  SetUnhandledExceptionFilter(E2eeCrashFilter);
+}
 
 // --- File-based log sink for WebRTC internal logs ---
 class FileLogSink : public webrtc::LogSink {
@@ -140,13 +264,100 @@ static std::string JsonEscape(const std::string& s) {
   return oss.str();
 }
 
+// --- Synthetic test video source (moving pattern) for single-machine testing ---
+// Enabled via env var E2EE_SYNTHETIC_VIDEO=1. Lets two client processes on one
+// machine both "send" video when only a single physical webcam is available.
+class SyntheticVideoCapturer : public webrtc::test::TestVideoCapturer {
+ public:
+  SyntheticVideoCapturer(int width, int height, int fps)
+      : width_(width), height_(height), fps_(fps > 0 ? fps : 30) {}
+  ~SyntheticVideoCapturer() override { Stop(); }
+
+  void Start() override {
+    if (running_.exchange(true)) return;
+    thread_ = std::make_unique<std::thread>(&SyntheticVideoCapturer::Loop, this);
+  }
+  void Stop() override {
+    if (!running_.exchange(false)) return;
+    if (thread_ && thread_->joinable()) thread_->join();
+    thread_.reset();
+  }
+  int GetFrameWidth() const override { return width_; }
+  int GetFrameHeight() const override { return height_; }
+
+ private:
+  void Loop() {
+    const int frame_interval_ms = 1000 / fps_;
+    uint32_t frame_num = 0;
+    while (running_.load()) {
+      auto buffer = webrtc::I420Buffer::Create(width_, height_);
+      uint8_t* y = buffer->MutableDataY();
+      const int stride_y = buffer->StrideY();
+      for (int r = 0; r < height_; ++r) {
+        for (int c = 0; c < width_; ++c) {
+          y[r * stride_y + c] =
+              static_cast<uint8_t>((c + r + frame_num * 3) & 0xFF);
+        }
+      }
+      uint8_t* u = buffer->MutableDataU();
+      uint8_t* v = buffer->MutableDataV();
+      const int cw = (width_ + 1) / 2;
+      const int ch = (height_ + 1) / 2;
+      const int stride_u = buffer->StrideU();
+      const int stride_v = buffer->StrideV();
+      for (int r = 0; r < ch; ++r) {
+        for (int c = 0; c < cw; ++c) {
+          u[r * stride_u + c] = static_cast<uint8_t>((c * 2 + frame_num) & 0xFF);
+          v[r * stride_v + c] =
+              static_cast<uint8_t>((r * 2 + frame_num * 2) & 0xFF);
+        }
+      }
+      webrtc::VideoFrame frame = webrtc::VideoFrame::Builder()
+                                     .set_video_frame_buffer(buffer)
+                                     .set_rotation(webrtc::kVideoRotation_0)
+                                     .set_timestamp_us(webrtc::TimeMicros())
+                                     .build();
+      OnFrame(frame);
+      ++frame_num;
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(frame_interval_ms));
+    }
+  }
+
+  int width_;
+  int height_;
+  int fps_;
+  std::atomic<bool> running_{false};
+  std::unique_ptr<std::thread> thread_;
+};
+
 // --- Video capture source (wraps VcmCapturer) ---
 class CapturerTrackSource : public webrtc::VideoTrackSource {
  public:
   static webrtc::scoped_refptr<CapturerTrackSource> Create() {
-    const size_t kWidth = 640;
-    const size_t kHeight = 480;
-    const size_t kFps = 30;
+    auto env_size = [](const char* name, size_t fallback) -> size_t {
+      const char* v = std::getenv(name);
+      if (v && v[0]) {
+        long parsed = std::strtol(v, nullptr, 10);
+        if (parsed > 0) return static_cast<size_t>(parsed);
+      }
+      return fallback;
+    };
+    const size_t kWidth = env_size("E2EE_VIDEO_WIDTH", 640);
+    const size_t kHeight = env_size("E2EE_VIDEO_HEIGHT", 480);
+    const size_t kFps = env_size("E2EE_VIDEO_FPS", 30);
+
+    const char* synth = std::getenv("E2EE_SYNTHETIC_VIDEO");
+    if (synth && synth[0] && synth[0] != '0') {
+      DEMO_LOG("Using SYNTHETIC video source (E2EE_SYNTHETIC_VIDEO=%s) %zux%zu@%zu",
+               synth, kWidth, kHeight, kFps);
+      auto capturer = std::make_unique<SyntheticVideoCapturer>(
+          static_cast<int>(kWidth), static_cast<int>(kHeight),
+          static_cast<int>(kFps));
+      capturer->Start();
+      return webrtc::make_ref_counted<CapturerTrackSource>(
+          std::unique_ptr<webrtc::test::TestVideoCapturer>(capturer.release()));
+    }
 
     std::unique_ptr<webrtc::VideoCaptureModule::DeviceInfo> info(
         webrtc::VideoCaptureFactory::CreateDeviceInfo());
@@ -355,6 +566,51 @@ struct WebrtcPeer : public webrtc::PeerConnectionObserver {
   // Logging
   std::unique_ptr<FileLogSink> log_sink;
 
+  // E2EE frame transformers.
+  // The send side of FrameTransformerInterface exposes only a single
+  // RegisterTransformedFrameCallback (no SSRC), so a transformer instance
+  // can serve exactly ONE sender — sharing one across audio+video senders
+  // makes the second registration clobber the first and routes frames to the
+  // wrong stream's callback (a native crash). We therefore use one transformer
+  // per sender. The receive side, although SSRC-keyed, must ALSO use one
+  // transformer per receiver: WebRTC's receive delegate static_casts the
+  // returned frame to its own media type (e.g. TransformableVideoReceiverFrame)
+  // without re-checking, so any cross-routing of an audio frame into the video
+  // delegate (or vice versa) corrupts the cast and crashes. A dedicated
+  // transformer per receiver makes cross-routing structurally impossible.
+  std::mutex e2ee_mutex;
+  std::vector<webrtc::scoped_refptr<E2eeFrameTransformer>> e2ee_send_transformers;
+  std::vector<webrtc::scoped_refptr<E2eeFrameTransformer>> e2ee_recv_transformers;
+  // Receiver ids we have already attached a transformer to. WebRTC fires a fatal
+  // RTC_CHECK if SetFrameTransformer is called twice on the same receiver with
+  // different transformer instances, so each receiver must be attached exactly
+  // once. (webrtc_create and OnTrack can both see the same receiver.)
+  std::set<std::string> e2ee_attached_receivers;
+  bool e2ee_has_key = false;
+  uint8_t e2ee_key_id = 0;
+  uint8_t e2ee_key[16] = {};
+
+  // Create a fresh receive transformer for one receiver, install the stored
+  // E2E key (if any), attach it, and remember it. Idempotent per receiver:
+  // a second call for the same receiver is a no-op (prevents WebRTC's
+  // duplicate-transformer fatal CHECK). Takes e2ee_mutex internally.
+  void AttachRecvTransformer(
+      const webrtc::scoped_refptr<webrtc::RtpReceiverInterface>& receiver) {
+    auto transformer = webrtc::make_ref_counted<E2eeFrameTransformer>();
+    {
+      std::lock_guard<std::mutex> lock(e2ee_mutex);
+      if (!e2ee_attached_receivers.insert(receiver->id()).second) {
+        // Already attached to this receiver — do not attach a second instance.
+        return;
+      }
+      if (e2ee_has_key) {
+        transformer->SetE2eKey(e2ee_key_id, e2ee_key, 16);
+      }
+      e2ee_recv_transformers.push_back(transformer);
+    }
+    receiver->SetFrameTransformer(transformer);
+  }
+
   void PushEvent(const std::string& type, const std::string& data) {
     std::lock_guard<std::mutex> lock(events_mutex);
     events.push({type, data});
@@ -413,6 +669,12 @@ struct WebrtcPeer : public webrtc::PeerConnectionObserver {
              track ? track->kind().c_str() : "null",
              track ? track->enabled() : -1,
              track ? static_cast<int>(track->state()) : -1);
+
+    // Attach a dedicated E2EE receive transformer to this new incoming track.
+    // One transformer per receiver (never shared) — see WebrtcPeer notes.
+    AttachRecvTransformer(transceiver->receiver());
+    DEMO_LOG("E2EE recv transformer attached to new receiver");
+
     if (track && track->kind() == webrtc::MediaStreamTrackInterface::kAudioKind) {
       track->set_enabled(true);
       DEMO_LOG("OnTrack: enabled remote audio track");
@@ -446,6 +708,7 @@ struct WebrtcPeer : public webrtc::PeerConnectionObserver {
 extern "C" {
 
 WebrtcPeer* webrtc_create(int role, const char* username) {
+  InstallCrashHandler();
   DEMO_LOG("webrtc_create(role=%d, user=%s) starting...", role,
            username ? username : "(null)");
 
@@ -508,7 +771,7 @@ WebrtcPeer* webrtc_create(int role, const char* username) {
   stun.uri = "stun:stun.l.google.com:19302";
   config.servers.push_back(stun);
 
-  webrtc::PeerConnectionDependencies deps(peer);
+  webrtc::PeerConnectionDependencies deps(static_cast<webrtc::PeerConnectionObserver*>(peer));
   auto result = peer->factory->CreatePeerConnectionOrError(config, std::move(deps));
   if (!result.ok()) {
     DEMO_LOG("ERROR: CreatePeerConnectionOrError: %s", result.error().message());
@@ -576,6 +839,29 @@ WebrtcPeer* webrtc_create(int role, const char* username) {
     }
   } else {
     DEMO_LOG("Callee: no local video track (receive only)");
+  }
+
+  // Send transformers are created per sender below; receive transformers are
+  // created per receiver (here for any pre-existing receivers, and in OnTrack
+  // for tracks that arrive later).
+
+  // Attach a dedicated send transformer to each outgoing RTP sender. One
+  // transformer per sender is required (see WebrtcPeer notes).
+  {
+    std::lock_guard<std::mutex> lock(peer->e2ee_mutex);
+    for (auto& sender : peer->pc->GetSenders()) {
+      auto transformer = webrtc::make_ref_counted<E2eeFrameTransformer>();
+      sender->SetFrameTransformer(transformer);
+      peer->e2ee_send_transformers.push_back(transformer);
+      DEMO_LOG("E2EE send transformer attached to sender (track: %s)",
+               sender->track() ? sender->track()->id().c_str() : "null");
+    }
+  }
+
+  // Attach a dedicated receive transformer to each already-present receiver.
+  for (auto& receiver : peer->pc->GetReceivers()) {
+    peer->AttachRecvTransformer(receiver);
+    DEMO_LOG("E2EE recv transformer attached to receiver");
   }
 
   DEMO_LOG("webrtc_create done");
@@ -809,6 +1095,33 @@ void webrtc_free_events(WebrtcEvent* events, int count) {
     free((void*)events[i].data);
   }
   delete[] events;
+}
+
+int webrtc_install_e2ee_key(WebrtcPeer* peer, int key_id,
+                            const unsigned char* key, int key_len) {
+  if (!peer || !key || key_len != 16) return -1;
+
+  uint8_t kid = static_cast<uint8_t>(key_id & 0xFF);
+
+  std::lock_guard<std::mutex> lock(peer->e2ee_mutex);
+
+  // Remember the key so any transformer can be (re)keyed if needed.
+  peer->e2ee_has_key = true;
+  peer->e2ee_key_id = kid;
+  memcpy(peer->e2ee_key, key, 16);
+
+  for (auto& transformer : peer->e2ee_send_transformers) {
+    if (transformer) transformer->SetE2eKey(kid, key, key_len);
+  }
+  DEMO_LOG("E2E send key installed on %zu sender(s), key_id=%u",
+           peer->e2ee_send_transformers.size(), kid);
+
+  for (auto& transformer : peer->e2ee_recv_transformers) {
+    if (transformer) transformer->SetE2eKey(kid, key, key_len);
+  }
+  DEMO_LOG("E2E recv key installed on %zu receiver(s), key_id=%u",
+           peer->e2ee_recv_transformers.size(), kid);
+  return 0;
 }
 
 }  // extern "C"
